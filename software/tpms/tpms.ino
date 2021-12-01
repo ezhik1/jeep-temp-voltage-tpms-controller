@@ -19,8 +19,8 @@
 #include "Lato_Thin_16.h"
 
 #define INPUT_BUTTON_PIN 3 // [ INT ]  digital read pin for button inputs
-#define HIGH_PRESSURE_PIN 6
-#define LOW_PRESSURE_PIN 7
+#define HIGH_PRESSURE_PIN 6 // [ OUTPUT ] to fan relay HIGH
+#define LOW_PRESSURE_PIN 7 // [ OUTPUT ] to fan relay LOW
 
 #define OLED_RESET -1 // [ ALIAS ] analog pin to reset the OLED display
 #define DISPLAY_WIDTH 64 // [ PIXELS ] number of available horizontal pixels
@@ -32,8 +32,8 @@
 #define MIN_LONG_PRESS_TIME 1000 // [ MILLISECONDS ] : before a press is considered 'long'
 
 #define LEAVE_EDIT_MODE_TIME 20000 // [ MILLISECONDS ] before disabling editMode due to inactivity
-#define NUMBER_OF_EDIT_MODE_SCREENS 2 // pressure set, tire id
-#define LAST_LINE_INDENT 12
+#define NUMBER_OF_EDIT_MODE_SCREENS 2 // UIs for editing stored values: pressure set, tire id
+#define LAST_LINE_PADDING 12 // [ PIXELS ] default padding for next line printed, used by slowType()
 
 const int BUTTONS_TOTAL = 3;
 const int BUTTONS_VALUES[ BUTTONS_TOTAL ] = { 0, 320, 460 }; // [ INT ] : ADC values from voltage divider that separates the action buttons
@@ -250,10 +250,10 @@ void listenToButtonPushes(){
 	bool upButtonIsReleased = buttons.onRelease( BUTTON_UP );
 	bool downButtonIsReleased = buttons.onRelease( BUTTON_DOWN );
 
-	bool buttonPressed = enterButtonIsPressed ? 1 : upButtonIsPressed ? 2 : downButtonIsPressed ? 3 : 0;
+	byte buttonPressed = enterButtonIsPressed ? 1 : upButtonIsPressed ? 2 : downButtonIsPressed ? 3 : 0;
 	bool isButtonPressed = ( buttonPressed != 0 ) ? true : false;
 
-	bool buttonReleased = enterButtonIsReleased ? 1 : upButtonIsReleased ? 2 : downButtonIsReleased ? 3 : 0;
+	byte buttonReleased = enterButtonIsReleased ? 1 : upButtonIsReleased ? 2 : downButtonIsReleased ? 3 : 0;
 	bool isButtonReleased = ( buttonReleased != 0 ) ? true : false;
 
 	if( !isPressing && isButtonPressed ){
@@ -327,7 +327,7 @@ void changeProgramState( int buttonIndex, String type ){
 
 	// EDIT : LOW TRIGGER
 
-	// UP Button is short pressed
+	// UP/DOWN Button is short pressed
 	if( isEditMode && type == "short" ){
 
 		int direction = 0;
@@ -511,8 +511,8 @@ void initializeRFChip(){
 	byte retrycount = 0;
 
 	while( retrycount < 5 ){
-		display.fillRect( 54, lastLine - LAST_LINE_INDENT, 10,10,BLACK );
-		display.setCursor( 54, lastLine - LAST_LINE_INDENT );
+		display.fillRect( 54, lastLine - LAST_LINE_PADDING, 10,10,BLACK );
+		display.setCursor( 54, lastLine - LAST_LINE_PADDING );
 		display.print( retrycount + 1 );
 		display.display();
 		#ifdef SHOWDEBUGINFO
@@ -580,14 +580,14 @@ void initializeRFChip(){
 	}
 
 	if( resetFailed || rfChipRegistrationHasFailed > 0 ){
-		lastLine += LAST_LINE_INDENT + 5;
+		lastLine += LAST_LINE_PADDING + 5;
 		slowType( "PUSH ENTER", 50, true );
 		slowType( "TO REBOOT", 50, true );
 		display.setFont(&Lato_Thin_12);
 
 		while( true ){
 
-			display.setCursor( 10, lastLine + LAST_LINE_INDENT );
+			display.setCursor( 10, lastLine + LAST_LINE_PADDING );
 			display.fillRoundRect( 8, lastLine, 46, 16, 3, alert );
 			display.setTextColor( !alert );
 			display.print( "ENTER" );
@@ -679,7 +679,7 @@ void slowType( String text, int delayTime, bool newLine ){
 	if( newLine ){
 
 		display.setCursor(0, lastLine );
-		lastLine += LAST_LINE_INDENT;
+		lastLine += LAST_LINE_PADDING;
 	}
 
 	for( int i = 0; i < text.length(); i++ ){
