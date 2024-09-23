@@ -27,8 +27,8 @@
 #define ENTER_BUTTON_PIN 2 // [ INT ]  digital read pin for button inputs
 #define DOWN_BUTTON_PIN 3 // [ INT ]  digital read pin for button inputs
 #define UP_BUTTON_PIN 4 // [ INT ]  digital read pin for button inputs
-#define LOW_FAN_SPEED_OVERRIDE_PIN 10 // [ INT ]  digital out pin for HIGH speed fan trigger
-#define HIGH_FAN_SPEED_OVERRIDE_PIN 11 // [ INT ]  digital out pin for HIGH speed fan trigger
+#define LOW_FAN_SPEED_OVERRIDE_PIN 10 // [ INT ]  digital input pin for LOW speed override
+#define HIGH_FAN_SPEED_OVERRIDE_PIN 11 // [ INT ]  digital imput pin for HIGH speed override
 
 // Controller Output Pins
 #define LOW_FAN_SPEED_PIN 5 // [ INT ]  digital out pin for LOW speed fan trigger
@@ -45,6 +45,7 @@
 #define NUM_READINGS 3 // [ INT ] number of readings that contribute to a rolling average of RAW VOLTAGE
 #define FAN_ANIMATION_INTERVAL 8 // [ MILLISECONDS ] before updating fan animation
 #define GRAPH_ANIMATION_INTERVAL 5000 // [ MILLISECONDS ] to animate historical graph and record another datum
+#define NO_TEMPERATURE_ALERT_INTERVAL 400 // [ MILLISECONDS ] between alert flashes
 #define LEAVE_EDIT_MODE_TIME 5000 // [ MILLISECONDS ] before disabling editMode due to inactivity
 
 // User Input Button Behaviour
@@ -70,6 +71,7 @@ ezButton downButton( DOWN_BUTTON_PIN );
 // States
 bool redraw = true;
 bool advanceGraph = false;
+bool alert = false;
 bool isPressing = false;
 bool isLongPressDetected = false;
 bool isEditingLowSpeedTrigger = false;
@@ -83,10 +85,12 @@ bool isCoolingBufferLow = false;
 bool isHighOverride = false;
 bool isLowOverride = false;
 bool externalRequestToRunLowSpeed = true;
+bool isTemperatureReadingValid = false;
 
 // Stateful variables
 unsigned long previousMillisGraphAnimation = 0;
 unsigned long previousMillisFanAnimation = 0;
+unsigned long previousMillisNoTempAlert = 0;
 unsigned long pressedTime = 0;
 unsigned long releasedTime = 0;
 unsigned long editModeTime = 0;
@@ -205,6 +209,12 @@ void advanceAnimationTicks(){
 
 		angle = ( angle + rate == 360 ) ? 0 : angle + rate;
 	}
+
+	if( previousMillisNoTempAlert == 0 || currentMillis - previousMillisNoTempAlert > NO_TEMPERATURE_ALERT_INTERVAL ){
+
+		previousMillisNoTempAlert = currentMillis;
+		alert = !alert;
+	}
 }
 
 void updateDisplayReading(){
@@ -228,6 +238,8 @@ void determineFanRelayState(){
 	externalRequestToRunLowSpeed = digitalRead( AC_STATE_PIN );
 	isLowOverride = digitalRead( LOW_FAN_SPEED_OVERRIDE_PIN );
 	isHighOverride = digitalRead( HIGH_FAN_SPEED_OVERRIDE_PIN );
+
+	isTemperatureReadingValid = currentTemperatureReading > SENSOR_MIN_TEMPERATURE;
 
 	// Buffered cooling should trigger when either a LOW or HIGH fan event is triggered
 	// This should continue in the highest event reached until coolant returns to the optimal temperature.
@@ -257,10 +269,12 @@ void determineFanRelayState(){
 	// RUN LOW SPEED
 	// - specific fan speed threshold reached
 	// - external source requested and system is warm enough to supplement cooling
+	// - temp sensor is not reporting, but ECU is requesting supplemental cooling ie. A/C trigger
 	// - LOW speed is already triggerd and should cool below the LOW trigger before turning off
 	}else if(
 		( currentTemperatureReading >= lowSpeedTriggerTemperature ) ||
 		( externalRequestToRunLowSpeed && currentTemperatureReading > optimalTemperature ) ||
+		( externalRequestToRunLowSpeed && !isTemperatureReadingValid ) ||
 		shouldBufferCoolLow
 	){
 
@@ -497,7 +511,7 @@ void drawNumeric( byte xOffset, byte yOffset, byte decimal, String label  ){
 	display.setFont(&Lato_Thin_30);
 	display.setTextColor( WHITE );
 
-	if( currentTemperatureReading < SENSOR_MIN_TEMPERATURE ){
+	if( !isTemperatureReadingValid ){
 
 		display.drawBitmap( xOffset + 16, yOffset - 25, warningIcon, 30, 30, WHITE );
 	}else{
@@ -520,13 +534,17 @@ void drawNumeric( byte xOffset, byte yOffset, byte decimal, String label  ){
 	display.fillRect (xOffset, yOffset + 3, DISPLAY_WIDTH, 10, BLACK); // clear previous num
 	display.fillRect (xOffset, yOffset + 5, ( DISPLAY_WIDTH ) + 8, 40, BLACK); // clear state area
 
-	if( currentTemperatureReading < SENSOR_MIN_TEMPERATURE ){
+	if(
+		!isTemperatureReadingValid &&
+		!( lowSpeedFanShouldRun || highSpeedFanShouldRun || isLowOverride || isHighOverride )
+	){
 
-		display.setTextColor( !advanceGraph );
+		display.setTextColor( !alert );
 		display.setCursor( 0, yOffset + 22 );
 		display.print( F(" NO TEMPERATURE DATA") );
 		display.setTextColor( WHITE );
-		return; // may be safe to remove
+
+		return; // prevent UI draw collisions
 	}else if( isEditingLowSpeedTrigger || isEditingHighSpeedTrigger ){
 
 		display.print( F("SET TRIGGERS") );
@@ -569,8 +587,13 @@ void drawNumeric( byte xOffset, byte yOffset, byte decimal, String label  ){
 		display.setCursor( 7, yOffset + 28 );
 		display.setTextColor( WHITE );
 
+		// fans are in manual override
+		if( !isTemperatureReadingValid ){
+
+			display.drawRoundRect( 2, yOffset + 15, 72, 18, 2, WHITE );
+			display.print( F("OVERRIDE") );
 		// under temp
-		if( currentTemperatureReading < OPERATING_TEMPERATURE ){
+		}else if( currentTemperatureReading < OPERATING_TEMPERATURE ){
 
 			display.drawRoundRect( 2, yOffset + 15, 68, 18, 2, WHITE );
 			display.print( F("HEATING") );
@@ -637,9 +660,6 @@ void displayAnimatedFan(){
 		for( int i = 0; i < numberOfFanBlades; i++ ){
 			drawFanBlade( radius, xOffset, yOffset, i * angle );
 		}
-	}else{
-
-		display.fillCircle( xCenter + xOffset, yCenter + yOffset, radius + 2, BLACK );
 	}
 }
 
