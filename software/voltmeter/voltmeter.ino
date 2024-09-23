@@ -21,7 +21,7 @@
 
 // Voltage Measurements and Display Characteristics
 #define REFERENCE_VOLTAGE 1.1 // [ Volts ] : FLOAT : internal VCC+ used for reference to compute Measured Voltage on A3
-#define MAX_VOLTAGE_GRAPHED 18 // [ Volts ] : INT : maximum voltage displayed  * nominal voltage 14
+#define MAX_VOLTAGE_GRAPHED 16 // [ Volts ] : INT : maximum voltage displayed  * nominal voltage 14
 #define MIN_VOLTAGE_GRAPHED 10  // [ Volts ] : INT : minimum voltage displayed
 #define LOW_VOLTAGE_ALERT_VOLTAGE 11.0 // [ Volts ] : FLOAT : at which point the display should warn of low voltage
 #define MIN_VOLTAGE_MEASURED 0.0 // [ VOLTS ] : FLOAT : minimum voltage measured
@@ -31,7 +31,7 @@
 #define GRAPH_ANIMATION_INTERVAL 500 // [ MILLISECONDS ] : between historical graph updates
 #define LOW_VOLTAGE_ALERT_INTERVAL 400 // [ MILLISECONDS ] : between flashes of Low Voltage
 
-float R1 = 150000.00; // [ OHMS ] : 100K
+float R1 = 160000.00; // [ OHMS ] : 100K
 float R2 = 10000.00; // [ OHMS ] : 10K
 
 Adafruit_SSD1306 display(DISPLAY_WIDTH, DISPLAY_HEIGHT, &Wire, OLED_RESET);
@@ -151,7 +151,9 @@ void updateDisplayReading(){
 
 void calculateVoltage(){
 
-	int rawVoltageReading = analogRead( VOLTAGE_RAW_PIN );
+	unsigned int rawVoltageReading = analogRead( VOLTAGE_RAW_PIN );
+
+	// rawVoltageReading = 1000; // DEBUG -> fixed raw analog read value
 
 	// bail early if nearly-zero volts read on sense pin
 	if( rawVoltageReading < 50 ){
@@ -162,7 +164,6 @@ void calculateVoltage(){
 
 	rawTotal -= readings[ readIndex ];
 	readings[ readIndex ] = rawVoltageReading; // [ 0 - 5v ] -> [ 102 - 1023 ]
-	// readings[ readIndex ] = 1024; // DEBUG -> fixed raw analog read value
 	// readings[ readIndex ] = ( random()%2 == 0 ) ? 600.0 : 300.0; // DEBUG -> random raw analog read value
 
 	rawTotal += readings[ readIndex ];
@@ -227,9 +228,6 @@ void drawNumeric( byte xOffset, byte yOffset, byte decimal, String label ){
 
 	display.fillRect( xOffset,0, DISPLAY_WIDTH, yOffset + 23, BLACK ); // clear previous num
 
-	display.setCursor( xOffset, yOffset + 23 );
-	display.setFont(&Lato_Thin_50);
-
 
 	if( currentVoltageReading < MIN_VOLTAGE_MEASURED ){
 		// Alert Text
@@ -246,18 +244,21 @@ void drawNumeric( byte xOffset, byte yOffset, byte decimal, String label ){
 
 		if( currentVoltageReading < LOW_VOLTAGE_ALERT_VOLTAGE ){
 			display.setTextColor( alert );
-			display.fillRoundRect( xOffset + 1 ,4, 100, yOffset + 19, 3, !alert );
+			display.fillRoundRect( xOffset + 1 ,2, 100, yOffset + 19, 3, !alert );
 		}else{
 			display.setTextColor( WHITE );
 		}
+
 		// Numeric Voltage
-		display.print(Format( currentDisplayReading,3, decimal ));
-		display.setCursor( xOffset + DISPLAY_WIDTH/2 + 47, yOffset + 20 );
+		display.setCursor( xOffset, yOffset + 19 );
+		display.setFont(&Lato_Thin_50);
+		display.print(Format( currentDisplayReading, 3, decimal ));
 
 		// Unit
 		display.setTextColor( WHITE );
 		display.setTextSize(1);
 		display.setFont( &Lato_Thin_12 );
+		display.setCursor( xOffset + DISPLAY_WIDTH/2 + 47, yOffset + 20 );
 		display.print( label );
 
 		// Icon
