@@ -1,15 +1,6 @@
-// Cooland Temperature Controller
-// - OLED display
-// - Historical reporting
-// - Temperature Control:
-// -- Fan OFF Temp:
-// -- Fan ON:
-// ---- LOW SPEED : Temp from Probe [ or ] signal from A/C state
-// ---- HIGH SPEED : Temp from Probe
+#include "EEPROM_FLASH.h" // RP2040 does not support EEPROM natively, nor SAMD EEPROM emulation
 
-#define BUFFER_LENGTH  8
-#include <Wire.h>
-#include <EEPROM.h>
+#include <ArduinoJson.h>
 #include <ezButton.h>
 #include <DallasTemperature.h>
 #include <Adafruit_GFX.h>
@@ -17,36 +8,46 @@
 #include "Lato_Thin_30.h"
 #include "Lato_Thin_12.h"
 
-#define OLED_RESET -1 // [ ALIAS ] analog pin to reset the OLED display
+#define OLED_RESET -1 // [ ALIAS ] analog pin to reset the OLED display\
+
+// #define DEBUG
 
 // Sensor Input Pins
-#define AC_STATE_PIN A2 // [ ALIAS ] analog pin to read Air Conditioning or car Fan State
-#define TEMP_SENSE_PIN 9 // [ INT ] pin to read Temperature data
+
+// DEBUG analog pin to read simulated temperature (use potentiometer on this pin)
+#ifdef DEBUG
+	#define AC_STATE_PIN A3 // [ ALIAS ] analog pin to read simulated temperature. borrow A/C state pin b/c XIAO  has limited analog pins
+#else
+	#define AC_STATE_PIN D3 // [ ALIAS ] digtial pin to read A/C fan state
+#endif
+
+#define TEMP_SENSE_PIN D8 // [ INT ] digital pin to read Temperature data
 
 // User Input Pins
-#define ENTER_BUTTON_PIN 2 // [ INT ]  digital read pin for button inputs
-#define DOWN_BUTTON_PIN 3 // [ INT ]  digital read pin for button inputs
-#define UP_BUTTON_PIN 4 // [ INT ]  digital read pin for button inputs
-#define LOW_FAN_SPEED_OVERRIDE_PIN 10 // [ INT ]  digital input pin for LOW speed override
-#define HIGH_FAN_SPEED_OVERRIDE_PIN 11 // [ INT ]  digital imput pin for HIGH speed override
+#define ENTER_BUTTON_PIN D0 // [ INT ]  digital read pin for button inputs
+#define DOWN_BUTTON_PIN D1 // [ INT ]  digital read pin for button inputs
+#define UP_BUTTON_PIN D2 // [ INT ]  digital read pin for button inputs
+#define LOW_FAN_SPEED_OVERRIDE_PIN D6 // [ INT ]  digital input pin for LOW speed override
+#define HIGH_FAN_SPEED_OVERRIDE_PIN D7 // [ INT ]  digital imput pin for HIGH speed override
 
 // Controller Output Pins
-#define LOW_FAN_SPEED_PIN 5 // [ INT ]  digital out pin for LOW speed fan trigger
-#define HIGH_FAN_SPEED_PIN 6 // [ INT ]  digital out pin for HIGH speed fan trigger
+#define LOW_FAN_SPEED_PIN D9 // [ INT ]  digital out pin for LOW speed fan trigger
+#define HIGH_FAN_SPEED_PIN D10 // [ INT ]  digital out pin for HIGH speed fan trigger
 
 // Display, UI Characteristics
 #define DISPLAY_WIDTH 128 // [ PIXELS ] number of available horizontal pixels
 #define DISPLAY_HEIGHT 64 // [ PIXELS ] number of available vertical pixels
 #define SCROLLING_GRAPH_HEIGHT 30 // [ PIXELS ] vertical size of the historical graph
-#define SCROLLING_GRAPH_SAMPLE_SIZE 25 // [ INT ] number of readings displayed in the historical graph
+#define SCROLLING_GRAPH_SAMPLE_SIZE 27 // [ INT ] number of readings displayed in the historical graph
 #define TEMP_LABEL "'C" // temperature unit label
 #define LOW_LABEL "LOW"
 #define HIGH_LABEL "HIGH"
 #define NUM_READINGS 3 // [ INT ] number of readings that contribute to a rolling average of RAW VOLTAGE
 #define FAN_ANIMATION_INTERVAL 8 // [ MILLISECONDS ] before updating fan animation
-#define GRAPH_ANIMATION_INTERVAL 5000 // [ MILLISECONDS ] to animate historical graph and record another datum
+#define GRAPH_ANIMATION_INTERVAL 500 // [ MILLISECONDS ] to animate historical graph and record another datum
 #define NO_TEMPERATURE_ALERT_INTERVAL 400 // [ MILLISECONDS ] between alert flashes
 #define LEAVE_EDIT_MODE_TIME 5000 // [ MILLISECONDS ] before disabling editMode due to inactivity
+#define PRIMARY_DISPLAY_SHOW_TIME 30000 // [ MILLISECONDS ] before wiping off primary display
 
 // User Input Button Behaviour
 #define MAX_SHORT_PRESS_TIME 500 // [ MILLISECONDS ] : before a short press is no longer 'short'
@@ -55,13 +56,15 @@
 // Voltage Measurements and Display Characteristics
 #define SENSOR_MAX_TEMPERATURE 125.0 // [ DEGREES ] : ( Celcius ) : maximum temperature reported from sensor
 #define SENSOR_MIN_TEMPERATURE -55.0 // [ DEGREES ] : ( Celcius ) : minimum temperature reported from sensor
-#define MIN_TEMPERATURE 60.0  // [ DEGREES ] : ( Celcius ) : minimum temperature displayed ( 140F )
-#define MAX_TEMPERATURE 121.11 // [ DEGREES ] : ( Celcius ) : maximum temperature displayed ( 250F )
+#define MIN_DISPLAY_TEMPERATURE 60.0  // [ DEGREES ] : ( Celcius ) : minimum temperature displayed ( 140F )
+#define MAX_DISPLAY_TEMPERATURE 120.0 // [ DEGREES ] : ( Celcius ) : maximum temperature displayed ( 250F )
 #define OVERHEAT_TEMPERATURE 112 // [ DEGREES ] : ( Celcius ) : maximum safe operating temperature ( 239F )
 #define OPERATING_TEMPERATURE 90.5 // [ DEGREES ] : ( Celcius ) : normal operating temperature, also the thermostat trigger temp ( 195F )
 #define EASE_COEFFICIENT 0.15 // [ DECIMAL ] : between 0-1 strength with which to dampen title scrolling, 0: strong damping 1: no damping
 
-Adafruit_SSD1306 display( DISPLAY_WIDTH, DISPLAY_HEIGHT, &Wire, OLED_RESET );
+Adafruit_SSD1306 displayPrimary( DISPLAY_WIDTH, DISPLAY_HEIGHT, &Wire, OLED_RESET );
+Adafruit_SSD1306 displayRemote( DISPLAY_WIDTH, DISPLAY_HEIGHT, &Wire, OLED_RESET );
+
 OneWire oneWire( TEMP_SENSE_PIN );
 DallasTemperature temperatureSensor( &oneWire );
 ezButton enterButton( ENTER_BUTTON_PIN );
@@ -69,6 +72,8 @@ ezButton upButton( UP_BUTTON_PIN );
 ezButton downButton( DOWN_BUTTON_PIN );
 
 // States
+
+// UI States
 bool redraw = true;
 bool advanceGraph = false;
 bool alert = false;
@@ -76,38 +81,44 @@ bool isPressing = false;
 bool isLongPressDetected = false;
 bool isEditingLowSpeedTrigger = false;
 bool isEditingHighSpeedTrigger = false;
+bool fanUIShouldSpin = false;
+bool showPrimayDisplay = true;
+bool wipeOnce = true;
+
+// Controller States
 bool lowSpeedFanShouldRun = false;
 bool highSpeedFanShouldRun = false;
 bool isBufferCooling = false;
 bool shouldBufferCoolHigh = false;
 bool shouldBufferCoolLow = false;
-bool isCoolingBufferLow = false;
 bool isHighOverride = false;
 bool isLowOverride = false;
 bool externalRequestToRunLowSpeed = true;
 bool isTemperatureReadingValid = false;
+bool isOverHeating = false;
 
 // Stateful variables
 unsigned long previousMillisGraphAnimation = 0;
-unsigned long previousMillisFanAnimation = 0;
 unsigned long previousMillisNoTempAlert = 0;
 unsigned long pressedTime = 0;
 unsigned long releasedTime = 0;
 unsigned long editModeTime = 0;
+unsigned long showPrimayDisplayTime = 0;
+
 byte buttonPressed = 0;
 byte buttonReleased = 0;
-float currentTemperatureReading = 0; // [ DEGREES ] : ( Celcius ) ( instantaneous ) between MIN_TEMPERATURE and MAX_TEMPERATURE
-float currentDisplayReading = 0; // [ DEGREES ] : ( Celcius ) : ( smoothed ) between MIN_TEMPERATURE and MAX_TEMPERATURE shown on screen
-float targetDisplayReading = 0; // [ DEGREES ] : ( Celcius ) : ( smoothed ) between MIN_TEMPERATURE and MAX_TEMPERATURE to which currentDisplayReading is approaching
-float angle = 0;  // [ DEGREES ] : current animated fan angle from 0 - 360
 
-byte storedLowSpeedTriggerTemperature = EEPROM.read( 0 );
-byte storedHighSpeedTriggerTemperature = EEPROM.read( 1 );
+float currentTemperatureReading = 0; // [ DEGREES ] : ( Celcius ) ( instantaneous ) between MIN_DISPLAY_TEMPERATURE and MAX_DISPLAY_TEMPERATURE
+float currentDisplayReading = 0; // [ DEGREES ] : ( Celcius ) : ( smoothed ) between MIN_DISPLAY_TEMPERATURE and MAX_DISPLAY_TEMPERATURE shown on screen
+float targetDisplayReading = 0; // [ DEGREES ] : ( Celcius ) : ( smoothed ) between MIN_DISPLAY_TEMPERATURE and MAX_DISPLAY_TEMPERATURE to which currentDisplayReading is approaching
+float currentFanRotationAngle = 0; // [ DEGREES ] : target fan rotation angle
+float currentFanSpeed = 0; // [ DEGREES ] : current fan speed
 
-byte lowSpeedTriggerTemperature =  ( storedLowSpeedTriggerTemperature != 255 ) ? storedLowSpeedTriggerTemperature : 93;// [ DEGREES ] : ( Celcius ) : when to kick on low speed relay
-byte highSpeedTriggerTemperature = ( storedHighSpeedTriggerTemperature != 255 ) ? storedHighSpeedTriggerTemperature : 105; // || 105;// [ DEGREES ] : ( Celcius ) : when to kick on high speed relay
-
-byte optimalTemperature = lowSpeedTriggerTemperature - 2; // [ DEGREES ] : ( Celcius ) : the target to which fans should cool before turning off
+byte storedLowSpeedTriggerTemperature;
+byte storedHighSpeedTriggerTemperature;
+byte lowSpeedTriggerTemperature;
+byte highSpeedTriggerTemperature;
+byte optimalTemperature;
 
 // Continuosly-Scrolling Vertical Bar Graph Characteristics
 char scrollingGraphArray[ SCROLLING_GRAPH_SAMPLE_SIZE ]; // float the bar graph resolution
@@ -130,10 +141,21 @@ const unsigned char warningIcon [] PROGMEM = { // 30x30
 
 void setup(){
 
+	#ifdef DEBUG
+		// DEBUG set analog read resolution to 12 bits (0-4095)
+		analogReadResolution(12);
+	#endif
+
 	temperatureSensor.begin();
 	enterButton.setDebounceTime( 10 );
 	upButton.setDebounceTime( 10 );
 	downButton.setDebounceTime( 10 );
+
+	displayPrimary.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+	wipeDisplay( displayPrimary );
+
+	displayRemote.begin(SSD1306_SWITCHCAPVCC, 0x3D);
+	wipeDisplay( displayRemote );
 
 	pinMode(AC_STATE_PIN, INPUT);
 	pinMode(TEMP_SENSE_PIN, INPUT);
@@ -141,16 +163,28 @@ void setup(){
 	pinMode(LOW_FAN_SPEED_PIN, OUTPUT);
 	pinMode(HIGH_FAN_SPEED_PIN, OUTPUT);
 
-	display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
-	wipeDisplay();
-	runSplashScreen();
+	Serial.begin( 115200 );
+
+	EEPROM_FLASH::begin();
+
+	storedLowSpeedTriggerTemperature = EEPROM_FLASH::read( 0 );
+	storedHighSpeedTriggerTemperature = EEPROM_FLASH::read( 1 );
+
+	lowSpeedTriggerTemperature =  ( storedLowSpeedTriggerTemperature != 255 ) ? storedLowSpeedTriggerTemperature : 93;// [ DEGREES ] : ( Celcius ) : when to kick on low speed relay
+	highSpeedTriggerTemperature = ( storedHighSpeedTriggerTemperature != 255 ) ? storedHighSpeedTriggerTemperature : 105; // || 105;// [ DEGREES ] : ( Celcius ) : when to kick on high speed relay
+	optimalTemperature = constrain( lowSpeedTriggerTemperature - 2, MIN_DISPLAY_TEMPERATURE, highSpeedTriggerTemperature ); // [ DEGREES ] : ( Celcius ) : the target to which fans should cool before turning off
+
+	runSplashScreen( displayPrimary );
+	runSplashScreen( displayRemote );
+
+	currentDisplayReading = 0;
 }
 
-void runSplashScreen(){
+void runSplashScreen( Adafruit_SSD1306 &display ){
 
-	rollingTitle(F("TEMP CONTROL"));
-	wipeDisplay();
-	currentDisplayReading = 0;
+	rollingTitle(F("TEMP CONTROL"), display );
+	wipeDisplay( display );
+
 	delay( 500 );
 }
 
@@ -165,16 +199,44 @@ void loop(){
 	updateDisplayReading();
 	advanceAnimationTicks();
 
-	render();
+	StaticJsonDocument<100> jsonOut;
+
+	jsonOut[ "currentTemperatureReading" ] = currentTemperatureReading;
+	jsonOut[ "lowSpeedFanShouldRun" ] = lowSpeedFanShouldRun;
+	jsonOut[ "highSpeedFanShouldRun" ] = highSpeedFanShouldRun;
+	jsonOut[ "isBufferCooling" ] = isBufferCooling;
+	jsonOut[ "isHighOverride" ] = isHighOverride;
+	jsonOut[ "isLowOverride" ] = isLowOverride;
+	jsonOut[ "externalRequestToRunLowSpeed" ] = externalRequestToRunLowSpeed;
+	jsonOut[ "isTemperatureReadingValid" ] = isTemperatureReadingValid;
+	jsonOut[ "lowSpeedTriggerTemperature" ] = lowSpeedTriggerTemperature;
+	jsonOut[ "highSpeedTriggerTemperature" ] = highSpeedTriggerTemperature;
+	jsonOut[ "isOverHeating" ] = isOverHeating;
+
+	serializeJson( jsonOut, Serial );
+	Serial.println(); // new line to separate json entries
+
+
+	if( showPrimayDisplay || isOverHeating ){
+
+		render( displayPrimary );
+	}else if( wipeOnce  ){
+
+		wipeDisplay( displayPrimary );
+		wipeOnce = false;
+	}
+
+	render( displayRemote );
 }
 
-void render(){
+void render( Adafruit_SSD1306 &display ){
 
-	displayNumericScrollView();
-	displayAnimatedFan();
+	displayNumericScrollView( display );
+	displayAnimatedFan( display );
 	display.display();
 
 	if( redraw ){
+
 		redraw = !redraw;
 	}
 }
@@ -185,29 +247,35 @@ void advanceAnimationTicks(){
 	advanceGraph = false;
 
 	bool graphAnimationTick = ( previousMillisGraphAnimation == 0 || currentMillis - previousMillisGraphAnimation > GRAPH_ANIMATION_INTERVAL );
-	bool fanAnimationTick = ( previousMillisFanAnimation == 0 || currentMillis - previousMillisFanAnimation > FAN_ANIMATION_INTERVAL );
 
 	if( graphAnimationTick ){
 
 		previousMillisGraphAnimation = currentMillis;
 		advanceGraph = true;
 
-		int scaledLevel = round(SCROLLING_GRAPH_HEIGHT * (((currentDisplayReading - MIN_TEMPERATURE ) / (MAX_TEMPERATURE- MIN_TEMPERATURE ))));
-		if( scaledLevel <= 0 ){
+		int scaledLevel = round((float) SCROLLING_GRAPH_HEIGHT *
+			((( currentDisplayReading - MIN_DISPLAY_TEMPERATURE ) / ( MAX_DISPLAY_TEMPERATURE - MIN_DISPLAY_TEMPERATURE ))));
+
+			if( scaledLevel <= 0 ){
+
 			scaledLevel = 0;
 		}
 
 		scrollingGraphArray[ 0 ] = scaledLevel;
 	}
 
-	if( fanAnimationTick && ( lowSpeedFanShouldRun || highSpeedFanShouldRun || isLowOverride || isHighOverride )){
+	if( fanUIShouldSpin ){
 
-		previousMillisFanAnimation = currentMillis;
+		float rate = ( highSpeedFanShouldRun ) ? 12.0 : // should be divisible by 360
+			( lowSpeedFanShouldRun ) ? 6.0 : 0.0;  // should be divisible by 360
 
-		float rate = ( highSpeedFanShouldRun || isHighOverride ) ? 18.0 : // should be divisible by 360
-			( lowSpeedFanShouldRun || isLowOverride ) ? 8.0 : 0.0;  // should be divisible by 360
+		currentFanSpeed = currentFanSpeed + ( rate - currentFanSpeed ) * 0.06;
+		currentFanRotationAngle += currentFanSpeed;
 
-		angle = ( angle + rate == 360 ) ? 0 : angle + rate;
+		if( currentFanSpeed <  0.05 ){
+
+			fanUIShouldSpin = false;
+		}
 	}
 
 	if( previousMillisNoTempAlert == 0 || currentMillis - previousMillisNoTempAlert > NO_TEMPERATURE_ALERT_INTERVAL ){
@@ -231,20 +299,44 @@ void updateDisplayReading(){
 
 void determineFanRelayState(){
 
-	// temporarily assume no fan should run
-	highSpeedFanShouldRun = lowSpeedFanShouldRun = false;
+	// Flags for Controller and UI States
 
-	// whether we should run the fans on external user or ECU request
-	externalRequestToRunLowSpeed = digitalRead( AC_STATE_PIN );
-	isLowOverride = digitalRead( LOW_FAN_SPEED_OVERRIDE_PIN );
-	isHighOverride = digitalRead( HIGH_FAN_SPEED_OVERRIDE_PIN );
+	// UI
+	// fanUIShouldSpin -- Fan Animation
+
+	// Controller
+	// highSpeedFanShouldRun -- Run HIGH speed fan relay
+	// lowSpeedFanShouldRun	 -- Run LOW speed fan relay
+	// shouldBufferCoolLow -- Run LOW speed fan relay until OPTIMAL temperature is reached
+	// shouldBufferCoolHigh -- Run HIGH speed fan relay until OPTIMAL temperature is reached
+
+
+	//NOTE: Inputs are pulled up to 3.3V, so invert logic for digitalRead()
+	#ifdef DEBUG
+		// DEBUG disble digital reads to allow simulated temperature (analog read from same pin)
+		externalRequestToRunLowSpeed = false;
+	#else
+		// whether we should run the fans on external user or ECU request
+		externalRequestToRunLowSpeed = !digitalRead( AC_STATE_PIN );
+	#endif
 
 	isTemperatureReadingValid = currentTemperatureReading > SENSOR_MIN_TEMPERATURE;
+	isOverHeating = currentTemperatureReading >= OVERHEAT_TEMPERATURE;
+	wipeOnce = isOverHeating ? true : wipeOnce;
+
+	// handle manual overrides first
+	highSpeedFanShouldRun = isHighOverride = !digitalRead( HIGH_FAN_SPEED_OVERRIDE_PIN );
+	lowSpeedFanShouldRun = isLowOverride = !digitalRead( LOW_FAN_SPEED_OVERRIDE_PIN );
+
+	// Manual Override, set relevant flags, and bail early
+	if( isLowOverride || isHighOverride ){
+
+		fanUIShouldSpin = true;
+		return;
+	}
 
 	// Buffered cooling should trigger when either a LOW or HIGH fan event is triggered
 	// This should continue in the highest event reached until coolant returns to the optimal temperature.
-	// shouldBufferCoolHigh = ( shouldBufferCoolHigh && ( currentTemperatureReading <= optimalTemperature )) ? false : shouldBufferCoolHigh;
-
 	if(( shouldBufferCoolHigh || shouldBufferCoolLow ) && currentTemperatureReading <= optimalTemperature ){
 
 		shouldBufferCoolHigh = shouldBufferCoolLow = false;
@@ -260,11 +352,9 @@ void determineFanRelayState(){
 	// - HIGH speed is already triggerd and should cool below the LOW trigger before turning off
 	if( currentTemperatureReading >= highSpeedTriggerTemperature || shouldBufferCoolHigh  ){
 
-		if( !isLowOverride ){
-
-			highSpeedFanShouldRun = !( lowSpeedFanShouldRun = false );
-			shouldBufferCoolHigh = true;
-		}
+		highSpeedFanShouldRun = !( lowSpeedFanShouldRun = false );
+		shouldBufferCoolHigh = true; // Controller flag for buffered cooling at HIGH speed to OPTIMAL temperature
+		fanUIShouldSpin = true; // UI flag for Fan Animation
 
 	// RUN LOW SPEED
 	// - specific fan speed threshold reached
@@ -278,11 +368,9 @@ void determineFanRelayState(){
 		shouldBufferCoolLow
 	){
 
-		if( !isHighOverride ){
-
-			highSpeedFanShouldRun = !( lowSpeedFanShouldRun = true );
-			shouldBufferCoolLow = true;
-		}
+		highSpeedFanShouldRun = !( lowSpeedFanShouldRun = true );
+		shouldBufferCoolLow = true;
+		fanUIShouldSpin = true;
 	}
 }
 
@@ -299,6 +387,12 @@ void listenToButtonPushes(){
 
 		isEditingLowSpeedTrigger = false;
 		isEditingHighSpeedTrigger = false;
+	}
+
+	if( showPrimayDisplay && ( millis() - showPrimayDisplayTime ) > PRIMARY_DISPLAY_SHOW_TIME ) {
+
+		showPrimayDisplay = false;
+		wipeOnce = true;
 	}
 
 	if( enterButton.isPressed() ){
@@ -346,6 +440,7 @@ void listenToButtonPushes(){
 			changeProgramState( buttonPressed, "short" );
 
 		}
+
 		buttonReleased = 0;
 		buttonPressed = 0;
 	}
@@ -364,66 +459,65 @@ void changeProgramState( int buttonIndex, String type ){
 
 	bool isEditMode = ( isEditingLowSpeedTrigger || isEditingHighSpeedTrigger );
 
+	showPrimayDisplayTime = millis();
+	showPrimayDisplay = true;
+
 	// Enter Button is long pressed ( enter edit mode )
-	if( type == "long" && buttonIndex == 1 && !isEditingLowSpeedTrigger ){
+	if( type == "long" && buttonIndex == 1 && !isEditMode ){
+
 		isEditingLowSpeedTrigger = true;
 		editModeTime = millis();
+		return;
 	}
 
 	// Long press Enter Button to exit edit mode
-	if( type == "long" && buttonIndex == 1 && isEditMode ){
+	if( type == "long" && isEditMode ){
+
 		isEditingLowSpeedTrigger = false;
-		isEditingLowSpeedTrigger = false;
+		isEditingHighSpeedTrigger = false;
 		return;
 	}
 
 	// EDIT MODE
 
-	// Keep edit mode alive
 	if( isEditMode && type == "short"  ){
-		editModeTime = millis();
+
+		editModeTime = millis(); // Keep edit mode alive on any short press during edit mode
+
+
+		if( buttonIndex == 1 ){ // enter button short press, switch targets
+
+			isEditingLowSpeedTrigger = !isEditingLowSpeedTrigger;
+			isEditingHighSpeedTrigger = !isEditingHighSpeedTrigger;
+			return;
+		}
+
+		int increment = buttonIndex == 2 ? 1 : buttonIndex == 3 ? -1 : 0;
+
+		if(isEditingLowSpeedTrigger ){
+
+			lowSpeedTriggerTemperature += increment;
+			constrainValueAndSave( lowSpeedTriggerTemperature, 0, optimalTemperature, highSpeedTriggerTemperature );
+		}else{
+
+			highSpeedTriggerTemperature += increment;
+			constrainValueAndSave( highSpeedTriggerTemperature, 1, lowSpeedTriggerTemperature, SENSOR_MAX_TEMPERATURE );
+		}
 	}
+}
 
-	// EDIT : LOW TRIGGER
+void constrainValueAndSave( byte &value, byte address, float min, float max ){
 
-	// UP Button is short pressed
-	if( isEditingLowSpeedTrigger && type == "short" && buttonIndex == 2 ){
+	byte valueToSave = constrain( value, min, max );
 
-		lowSpeedTriggerTemperature+= 1;
-		updateMemory( 0, lowSpeedTriggerTemperature );
-	// DOWN Button is short pressed
-	}else if( isEditingLowSpeedTrigger && type == "short" && buttonIndex == 3 ){
+	value = valueToSave; // keep display value constrained
 
-		lowSpeedTriggerTemperature-= 1;
-		updateMemory( 0, lowSpeedTriggerTemperature );
-	// ENTER Button is short pressed
-	}else if( isEditingLowSpeedTrigger && type == "short" && buttonIndex == 1 ){
-		isEditingLowSpeedTrigger = false;
-		isEditingHighSpeedTrigger = true;
-		return;
-	}
-
-	// EDIT : HIGH TRIGGER
-
-	if( isEditingHighSpeedTrigger && type == "short" && buttonIndex == 2 ){
-
-		highSpeedTriggerTemperature += 1;
-		updateMemory( 1, highSpeedTriggerTemperature );
-	// DOWN Button is short pressed
-	}else if( isEditingHighSpeedTrigger && type == "short" && buttonIndex == 3 ){
-
-		highSpeedTriggerTemperature -= 1;
-		updateMemory( 1, highSpeedTriggerTemperature );
-	}else if( isEditingHighSpeedTrigger && type == "short" && buttonIndex == 1 ){
-
-		isEditingHighSpeedTrigger = false;
-		isEditingLowSpeedTrigger = true;
-	}
+	updateMemory( address, valueToSave );
 }
 
 void updateMemory( byte address, byte value ){
 
-	EEPROM.update( address, value );
+	EEPROM_FLASH::update( address, value );
 }
 
 void calculateCoolantTemperature(){
@@ -433,8 +527,14 @@ void calculateCoolantTemperature(){
 	temperatureSensor.requestTemperatures();
 	temperatureSensor.setWaitForConversion( true );
 
-	float reading = temperatureSensor.getTempCByIndex(0);
-	// float reading = map( analogRead( AC_STATE_PIN ), 0, 280, 0, 110 ); // DEBUG : simulate temp reading
+	#ifdef DEBUG
+		// DEBUG : simulate temp reading
+		float reading = map( analogRead( AC_STATE_PIN ), 0, 4095, 0, MAX_DISPLAY_TEMPERATURE ); // read from a potentiometer
+	#else
+		// actual temp reading
+		float reading = temperatureSensor.getTempCByIndex(0);
+	#endif
+
 
 	if( reading < SENSOR_MIN_TEMPERATURE ){
 
@@ -445,7 +545,7 @@ void calculateCoolantTemperature(){
 	rawTotal -= readings[ readIndex ];
 	readings[ readIndex ] = reading; // actual as-measured
 	// readings[ readIndex ] = 100.0; // DEBUG -> fixed temp value
-	// readings[ readIndex ] = ( random()%3 == 0 ) ? MIN_TEMPERATURE : MAX_TEMPERATURE; // DEBUG -> random raw boost value
+	// readings[ readIndex ] = ( random()%3 == 0 ) ? MIN_DISPLAY_TEMPERATURE : MAX_DISPLAY_TEMPERATURE; // DEBUG -> random raw boost value
 
 	rawTotal += readings[ readIndex ];
 	readIndex = ( readIndex + 1 ) % NUM_READINGS; // wrap if at end of total samples
@@ -456,12 +556,12 @@ void calculateCoolantTemperature(){
 	}
 
 	float rawValue = rawTotal / NUM_READINGS;
-	currentTemperatureReading = constrain( rawValue, SENSOR_MIN_TEMPERATURE, MAX_TEMPERATURE );
+	currentTemperatureReading = constrain( rawValue, SENSOR_MIN_TEMPERATURE, MAX_DISPLAY_TEMPERATURE );
 
 	delay(1);
 }
 
-void rollingTitle( String label ){
+void rollingTitle( String label, Adafruit_SSD1306 &display ){
 
 	byte destinationY = DISPLAY_HEIGHT/2 + 10;
 	float splashScreenTextPosition = 0;
@@ -496,16 +596,16 @@ void rollingTitle( String label ){
 	splashScreenTextPosition = 0;
 }
 
-void displayNumericScrollView(){
+void displayNumericScrollView( Adafruit_SSD1306 &display ){
 
 	// Large Numeric Display
-	drawNumeric( 0, 21, 0, TEMP_LABEL );
+	drawNumeric( 0, 21, 0, TEMP_LABEL, display );
 
 	// Rolling Bar Chart
-	drawGraph( 73, 0, 49 );
+	drawGraph( 73, 0, 50, display );
 }
 
-void drawNumeric( byte xOffset, byte yOffset, byte decimal, String label  ){
+void drawNumeric( byte xOffset, byte yOffset, byte decimal, String label, Adafruit_SSD1306 &display ){
 
 	display.fillRect (xOffset, 0, 70, yOffset + 5, BLACK); // clear previous num
 	display.setFont(&Lato_Thin_30);
@@ -536,7 +636,7 @@ void drawNumeric( byte xOffset, byte yOffset, byte decimal, String label  ){
 
 	if(
 		!isTemperatureReadingValid &&
-		!( lowSpeedFanShouldRun || highSpeedFanShouldRun || isLowOverride || isHighOverride )
+		!( lowSpeedFanShouldRun || highSpeedFanShouldRun )
 	){
 
 		display.setTextColor( !alert );
@@ -588,7 +688,7 @@ void drawNumeric( byte xOffset, byte yOffset, byte decimal, String label  ){
 		display.setTextColor( WHITE );
 
 		// fans are in manual override
-		if( !isTemperatureReadingValid ){
+		if( isHighOverride || isLowOverride ){
 
 			display.drawRoundRect( 2, yOffset + 15, 72, 18, 2, WHITE );
 			display.print( F("OVERRIDE") );
@@ -603,7 +703,7 @@ void drawNumeric( byte xOffset, byte yOffset, byte decimal, String label  ){
 
 			display.print( F("OPTIMAL") );
 
-		}else if( currentTemperatureReading > OVERHEAT_TEMPERATURE ){
+		}else if( isOverHeating ){
 
 			display.fillRoundRect( 2, yOffset + 15, 68, 18, 2, WHITE );
 			display.setTextColor( BLACK );
@@ -611,7 +711,7 @@ void drawNumeric( byte xOffset, byte yOffset, byte decimal, String label  ){
 			display.print( F("WARNING!") );
 
 		// actively cooling
-		}else if( lowSpeedFanShouldRun || highSpeedFanShouldRun || isLowOverride || isHighOverride ){
+		}else if( lowSpeedFanShouldRun || highSpeedFanShouldRun ){
 
 			display.drawRoundRect( 2, yOffset + 15, 68, 18, 2, WHITE );
 			display.print( F("COOLING") );
@@ -626,44 +726,46 @@ void drawNumeric( byte xOffset, byte yOffset, byte decimal, String label  ){
 		display.drawRoundRect(0, yOffset + 29, 40, 14, 2, WHITE );
 	}
 
-	display.fillCircle( DISPLAY_WIDTH / 2 + 20, yOffset + 20, 7, ( highSpeedFanShouldRun || isHighOverride ));
-	display.fillCircle( DISPLAY_WIDTH / 2 + 20, yOffset + 35, 7, ( lowSpeedFanShouldRun || isLowOverride ));
+	display.fillCircle( DISPLAY_WIDTH / 2 + 19, yOffset + 20, 7, ( highSpeedFanShouldRun ));
+	display.fillCircle( DISPLAY_WIDTH / 2 + 19, yOffset + 35, 7, ( lowSpeedFanShouldRun ));
 
 	// paint high and low letters, regardless of state, since they're always black, and a run state introduces a white-filled circle
-	display.setCursor( DISPLAY_WIDTH / 2 + 16,  yOffset + 24 );
+	display.setCursor( DISPLAY_WIDTH / 2 + 15,  yOffset + 24 );
 	display.setTextColor( BLACK );
 	display.print("H");
 
-	display.setCursor( DISPLAY_WIDTH / 2 + 17,  yOffset + 39 );
+	display.setCursor( DISPLAY_WIDTH / 2 + 16,  yOffset + 39 );
 	display.setTextColor( BLACK );
 	display.print("L");
 }
 
-void displayAnimatedFan(){
+void displayAnimatedFan( Adafruit_SSD1306 &display ){
+
+	if( !fanUIShouldSpin  ){
+
+		return;
+	}
 
 	byte numberOfFanBlades = 5;
-	byte angle = 360 / numberOfFanBlades;
+	float angle = 360.0 / (float) numberOfFanBlades;
 
-	int radius= 13;
-	int xCenter= radius;
-	int yCenter= radius;
+	byte radius= 14;
 
-	byte xOffset = DISPLAY_WIDTH - ( radius * 2 ) - 4;
-	byte yOffset = DISPLAY_HEIGHT / 2 + 3;
+	// Define exact pixel-center (sub-pixel to remove rounding drift)
+	const float centerX = (DISPLAY_WIDTH  - (radius * 2.0f) + radius ) - 3.0f;
+	const float centerY = (DISPLAY_HEIGHT / 2.0f) + radius + 1.0f;
 
-	if( lowSpeedFanShouldRun || highSpeedFanShouldRun || isLowOverride || isHighOverride ){
+	display.fillCircle(roundf( centerX ), roundf( centerY ), radius + 2, BLACK);
+	display.drawCircle(roundf( centerX ), roundf( centerY ), radius + 2, WHITE);
+	display.fillCircle(roundf( centerX ), roundf( centerY ), 2, WHITE);
 
-		display.fillCircle(xCenter + xOffset, yCenter + yOffset,radius + 2, BLACK); //  clear out old fan and everything inside it
-		display.drawCircle(xCenter + xOffset, yCenter + yOffset,radius + 2, WHITE); // fan perimeter
-		display.fillCircle(xCenter + xOffset, yCenter + yOffset, 2, WHITE); // center point
+	for( int i = 0; i < numberOfFanBlades; i++ ){
 
-		for( int i = 0; i < numberOfFanBlades; i++ ){
-			drawFanBlade( radius, xOffset, yOffset, i * angle );
-		}
+		drawFanBlade( radius, centerX, centerY, (float) i * angle, display );
 	}
 }
 
-void drawGraph( byte xOffset, byte yOffset, byte scrollingGraphWidth ){
+void drawGraph( byte xOffset, byte yOffset, byte scrollingGraphWidth, Adafruit_SSD1306 &display ){
 
 	byte bottomOfGraph = yOffset + SCROLLING_GRAPH_HEIGHT;
 	byte centerPoint = bottomOfGraph / 2;
@@ -673,22 +775,14 @@ void drawGraph( byte xOffset, byte yOffset, byte scrollingGraphWidth ){
 
 		byte position = scrollingGraphArray[ step ];
 
-		byte start= ( position > centerPoint ) ? ( bottomOfGraph - position ) : centerPoint;
-		byte length = ( position > centerPoint ) ? centerPoint - start : centerPoint - position;
+		byte start = ( position >= centerPoint ) ? ( bottomOfGraph - position ) : centerPoint;
+		byte length = ( position >= centerPoint ) ? centerPoint - start : centerPoint - position;
 
-		if( (position > centerPoint || position < centerPoint ) && position > 0 ){
+		display.writeFastVLine( scrollingGraphWidth + xOffset - (step * 2 ), yOffset, SCROLLING_GRAPH_HEIGHT, BLACK );
+
+		if( position > 0 ){ // only draw values that should be in visible range
 
 			display.writeFastVLine( scrollingGraphWidth + xOffset - (step * 2 ), start, length, WHITE ); // Line Datum
-		}
-
-		// clear previous line datum overflow below centerPoint
-		if( position < centerPoint ){
-			display.writeFastVLine( scrollingGraphWidth + xOffset - (step * 2 ), yOffset, centerPoint, BLACK ); // clear potential prev num off the top
-			display.writeFastVLine( scrollingGraphWidth + xOffset - (step * 2 ), start + length, position, BLACK );
-		}else{
-			// clear previous line datum above centerPoint
-			display.writeFastVLine( scrollingGraphWidth + xOffset - (step * 2 ), yOffset, SCROLLING_GRAPH_HEIGHT - position, BLACK );
-			display.writeFastVLine( scrollingGraphWidth + xOffset - (step * 2 ), centerPoint, centerPoint, BLACK ); // clear potential prev num below the centerPoint
 		}
 	}
 	if( advanceGraph ){
@@ -701,11 +795,12 @@ void drawGraph( byte xOffset, byte yOffset, byte scrollingGraphWidth ){
 
 	if( redraw ){
 		// center point of graph
-		display.writeFastHLine(scrollingGraphWidth + xOffset + 4, centerPoint, 2, WHITE);
+		display.writeFastHLine(scrollingGraphWidth + xOffset + 3, centerPoint - 1, 2, WHITE);
 	}
 }
 
-void wipeDisplay(){
+void wipeDisplay( Adafruit_SSD1306 &display ){
+
 	display.clearDisplay(); // remove library banner
 	display.fillScreen( BLACK ); // I see a red door...
 	display.display(); // because fillScreen is misleading
@@ -719,50 +814,50 @@ float lerp(float a, float b, float x){
 	return a + x * (b - a);
 }
 
-void drawFanBlade( int radius, int xOffset, int yOffset, int offset ){
+void drawFanBlade(float radius, float cx, float cy, float angleOffsetDegrees, Adafruit_SSD1306 &display ) {
 
-	int needleLength = radius - 5;
-	float theta = ( angle + offset ) * ( M_PI / 180 );
-	float x = -needleLength/2;
-	float y = 0;
-	float x1 = needleLength/2;
-	float y1 = 0;
-	float cx = (x + x1) / 2;
-	float cy = (y + y1) / 2;
-	float rotXEnd = (  (x1 - cx) * cos( theta ) + (y1 - cy) * sin( theta ) ) + cx;
-	float rotYEnd = ( -(x1 - cx) * sin( theta ) + (y1 - cy) * cos( theta ) ) + cy;
+	const float hubClearance = 5.0f; // distance from center to blade base
+	const float bladeLength = radius - hubClearance - 1; // blade span (pixels)
+	const float theta = ( currentFanRotationAngle + angleOffsetDegrees  ) * ( M_PI / 180.0f );
 
-	drawRotatedTriangle( 1, (rotXEnd + xOffset + radius), (rotYEnd + yOffset + radius), theta);
+	// tip is further out from center: base + bladeLength
+	const float tipDistance = hubClearance + bladeLength;
+	const float tipX = cx + tipDistance * cos( theta );
+	const float tipY = cy + tipDistance * sin( theta );
+
+	// pass bladeLength so triangle length matches actual blade geometry
+	drawRotatedTriangle(1, tipX, tipY, theta, bladeLength, display );
 }
 
-void drawRotatedTriangle( int sign, float xOffset, float yOffset, float theta ){
+void drawRotatedTriangle(int sign, float tipX, float tipY, float theta, float bladeLength, Adafruit_SSD1306 &display ) {
 
-	int tX = 1 * sign;
-	int tY = 0;
+	// Triangle defined relative to the tip. Back distance equals bladeLength.
+	const float tX  = -bladeLength; // back toward hub (float to avoid rounding drift)
+	const float tY  = 0.0f;
+	const float t1X = 0.0f;
+	const float t1Y = 3.0f * sign;
+	const float t2X = 0.0f;
+	const float t2Y = -3.0f * sign;
 
-	int t1X = 8;
-	int t1Y = 3 * sign;
+	// Rotate points around the tip
+	const float rtX  =  tX * cos( theta ) - tY * sin( theta );
+	const float rtY  =  tX * sin( theta ) + tY * cos( theta );
+	const float rt1X = t1X * cos( theta ) - t1Y * sin( theta );
+	const float rt1Y = t1X * sin( theta ) + t1Y * cos( theta );
+	const float rt2X = t2X * cos( theta ) - t2Y * sin( theta );
+	const float rt2Y = t2X * sin( theta ) + t2Y * cos( theta );
 
-	int t2X = 8;
-	int t2Y = -3 * sign;
-
-	float rtX = (  tX * cos( theta ) + tY * sin( theta ) );
-	float rtY = ( -tX * sin( theta ) + tY * cos( theta ) );
-
-	float rt1X = (  t1X * cos( theta ) + t1Y * sin( theta ) );
-	float rt1Y = ( -t1X * sin( theta ) + t1Y * cos( theta ) );
-
-	float rt2X = (  t2X * cos( theta ) + t2Y * sin( theta ) );
-	float rt2Y = ( -t2X * sin( theta ) + t2Y * cos( theta ) );
-
+	// Round only at draw time for consistency with circle center rounding
 	display.drawTriangle(
-		xOffset + rtX,
-		yOffset + rtY,
 
-		xOffset + rt1X,
-		yOffset + rt1Y,
+		roundf( tipX + rtX ),
+		roundf( tipY + rtY ),
 
-		xOffset + rt2X,
-		yOffset + rt2Y,
-	WHITE);
+		roundf( tipX + rt1X ),
+		roundf( tipY + rt1Y ),
+
+		roundf( tipX + rt2X ),
+		roundf( tipY + rt2Y ),
+		WHITE
+	);
 }
