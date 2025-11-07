@@ -159,6 +159,8 @@ void setup(){
 
 	pinMode(AC_STATE_PIN, INPUT);
 	pinMode(TEMP_SENSE_PIN, INPUT);
+	pinMode(LOW_FAN_SPEED_OVERRIDE_PIN, INPUT);
+	pinMode(HIGH_FAN_SPEED_OVERRIDE_PIN, INPUT);
 
 	pinMode(LOW_FAN_SPEED_PIN, OUTPUT);
 	pinMode(HIGH_FAN_SPEED_PIN, OUTPUT);
@@ -321,7 +323,7 @@ void determineFanRelayState(){
 	#endif
 
 	isTemperatureReadingValid = currentTemperatureReading > SENSOR_MIN_TEMPERATURE;
-	isOverHeating = currentTemperatureReading >= OVERHEAT_TEMPERATURE;
+	isOverHeating = isTemperatureReadingValid && currentTemperatureReading >= OVERHEAT_TEMPERATURE;
 	wipeOnce = isOverHeating ? true : wipeOnce;
 
 	// handle manual overrides first
