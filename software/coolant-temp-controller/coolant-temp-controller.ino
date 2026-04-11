@@ -1,6 +1,7 @@
-#include "EEPROM_FLASH.h" // RP2040 does not support EEPROM natively, nor SAMD EEPROM emulation
+#define SSD1306_NO_SPLASH // disable default splash screen
 
-#include <ArduinoJson.h>
+#include "EEPROM_FLASH.h" // RP2040 does not support EEPROM natively, nor SAMD EEPROM emulation
+#include <ArduinoJson.h>  // JSON over Serial for telemetry
 #include <ezButton.h>
 #include <DallasTemperature.h>
 #include <Adafruit_GFX.h>
@@ -48,6 +49,8 @@
 #define NO_TEMPERATURE_ALERT_INTERVAL 400 // [ MILLISECONDS ] between alert flashes
 #define LEAVE_EDIT_MODE_TIME 5000 // [ MILLISECONDS ] before disabling editMode due to inactivity
 #define PRIMARY_DISPLAY_SHOW_TIME 30000 // [ MILLISECONDS ] before wiping off primary display
+#define EASE_COEFFICIENT 0.15 // [ DECIMAL ] : between 0-1 strength with which to dampen title scrolling, 0: strong damping 1: no damping
+#define LAST_LINE_INDENT 10 // [ PIXELS ] default padding for next line printed, used by slowType()
 
 // User Input Button Behaviour
 #define MAX_SHORT_PRESS_TIME 500 // [ MILLISECONDS ] : before a short press is no longer 'short'
@@ -60,7 +63,12 @@
 #define MAX_DISPLAY_TEMPERATURE 120.0 // [ DEGREES ] : ( Celcius ) : maximum temperature displayed ( 250F )
 #define OVERHEAT_TEMPERATURE 112 // [ DEGREES ] : ( Celcius ) : maximum safe operating temperature ( 239F )
 #define OPERATING_TEMPERATURE 90.5 // [ DEGREES ] : ( Celcius ) : normal operating temperature, also the thermostat trigger temp ( 195F )
-#define EASE_COEFFICIENT 0.15 // [ DECIMAL ] : between 0-1 strength with which to dampen title scrolling, 0: strong damping 1: no damping
+
+// Sensor Configuration and Timing
+#define TEMPERATURE_SENSOR_RESOLUTION 9 // [ BITS ] : resolution of temperature sensor, higher is slower but more accurate, 9-12 bits available for this sensor
+// #define TEMPERATURE_SENSOR_READ_INTERVAL 1000 // [ MILLISECONDS ] : interval at which to read the temperature sensor
+// #define TEMP_CONVERSION_MS 1000 // [ MILLISECONDS ] : time it takes for the temperature sensor to perform a conversion
+#define NUMBER_OF_BAD_READINGS_THRESHOLD 10 // [ INT ] : number of consecutive bad readings before we alert the user to no temperature data and set isTemperatureReadingValid
 
 Adafruit_SSD1306 displayPrimary( DISPLAY_WIDTH, DISPLAY_HEIGHT, &Wire, OLED_RESET );
 Adafruit_SSD1306 displayRemote( DISPLAY_WIDTH, DISPLAY_HEIGHT, &Wire, OLED_RESET );
@@ -76,7 +84,7 @@ ezButton downButton( DOWN_BUTTON_PIN );
 // UI States
 bool redraw = true;
 bool advanceGraph = false;
-bool alert = false;
+bool noTemperatureDataAlertUI = false;
 bool isPressing = false;
 bool isLongPressDetected = false;
 bool isEditingLowSpeedTrigger = false;
@@ -97,6 +105,9 @@ bool externalRequestToRunLowSpeed = true;
 bool isTemperatureReadingValid = false;
 bool isOverHeating = false;
 
+// Sensor States
+bool shouldReadTemperature = false;
+
 // Stateful variables
 unsigned long previousMillisGraphAnimation = 0;
 unsigned long previousMillisNoTempAlert = 0;
@@ -104,6 +115,13 @@ unsigned long pressedTime = 0;
 unsigned long releasedTime = 0;
 unsigned long editModeTime = 0;
 unsigned long showPrimayDisplayTime = 0;
+byte lastLine = 0;
+
+unsigned long previousMillisTempRead = 0;
+unsigned long tempRequestDelayMillis = 0;
+byte numberOfBadReadings = 0; // [ INT ] count of consecutive bad readings from the sensor, used to determine when to alert user of no temperature data
+
+StaticJsonDocument<100> jsonOut;
 
 byte buttonPressed = 0;
 byte buttonReleased = 0;
@@ -146,16 +164,37 @@ void setup(){
 		analogReadResolution(12);
 	#endif
 
-	temperatureSensor.begin();
-	enterButton.setDebounceTime( 10 );
-	upButton.setDebounceTime( 10 );
-	downButton.setDebounceTime( 10 );
-
 	displayPrimary.begin(SSD1306_SWITCHCAPVCC, 0x3C);
 	wipeDisplay( displayPrimary );
 
 	displayRemote.begin(SSD1306_SWITCHCAPVCC, 0x3D);
 	wipeDisplay( displayRemote );
+
+	displayPrimary.setTextColor( WHITE );
+	displayPrimary.setTextSize( 1 );
+
+	displayRemote.setTextColor( WHITE );
+	displayRemote.setTextSize( 1 );
+
+	slowType( F("CONTROLLER STARTING >"), 20, true );
+
+	// Configure Temperature Sensor
+	slowType( F("BRINGING ONLINE >"), 20, true );
+	temperatureSensor.begin();
+	temperatureSensor.setResolution( TEMPERATURE_SENSOR_RESOLUTION );
+	temperatureSensor.setWaitForConversion( false );
+	temperatureSensor.requestTemperatures();
+	slowPrintSuccessOrFail( temperatureSensor.getDeviceCount() > 0);
+
+	tempRequestDelayMillis = 750 / ( 1 << ( 12 - TEMPERATURE_SENSOR_RESOLUTION )); // calculate delay based on sensor resolution, per datasheet timing
+	previousMillisTempRead= millis();
+
+	slowType( F("CONFIG INPUTS >"), 20, true );
+	enterButton.setDebounceTime( 10 );
+	upButton.setDebounceTime( 10 );
+	downButton.setDebounceTime( 10 );
+
+	Wire.setClock(1000000L);
 
 	pinMode(AC_STATE_PIN, INPUT);
 	pinMode(TEMP_SENSE_PIN, INPUT);
@@ -176,10 +215,12 @@ void setup(){
 	highSpeedTriggerTemperature = ( storedHighSpeedTriggerTemperature != 255 ) ? storedHighSpeedTriggerTemperature : 105; // || 105;// [ DEGREES ] : ( Celcius ) : when to kick on high speed relay
 	optimalTemperature = constrain( lowSpeedTriggerTemperature - 2, MIN_DISPLAY_TEMPERATURE, highSpeedTriggerTemperature ); // [ DEGREES ] : ( Celcius ) : the target to which fans should cool before turning off
 
-	runSplashScreen( displayPrimary );
-	runSplashScreen( displayRemote );
+	slowPrintSuccessOrFail( lowSpeedTriggerTemperature && highSpeedTriggerTemperature && optimalTemperature );
 
 	currentDisplayReading = 0;
+	delay( 1500 );
+	wipeDisplay( displayRemote );
+	wipeDisplay( displayPrimary );
 }
 
 void runSplashScreen( Adafruit_SSD1306 &display ){
@@ -199,36 +240,20 @@ void loop(){
 
 	listenToButtonPushes();
 	updateDisplayReading();
-	advanceAnimationTicks();
+	advanceUpdateTicks();
 
-	StaticJsonDocument<100> jsonOut;
+	render( displayRemote ); // always render to remote display
 
-	jsonOut[ "currentTemperatureReading" ] = currentTemperatureReading;
-	jsonOut[ "lowSpeedFanShouldRun" ] = lowSpeedFanShouldRun;
-	jsonOut[ "highSpeedFanShouldRun" ] = highSpeedFanShouldRun;
-	jsonOut[ "isBufferCooling" ] = isBufferCooling;
-	jsonOut[ "isHighOverride" ] = isHighOverride;
-	jsonOut[ "isLowOverride" ] = isLowOverride;
-	jsonOut[ "externalRequestToRunLowSpeed" ] = externalRequestToRunLowSpeed;
-	jsonOut[ "isTemperatureReadingValid" ] = isTemperatureReadingValid;
-	jsonOut[ "lowSpeedTriggerTemperature" ] = lowSpeedTriggerTemperature;
-	jsonOut[ "highSpeedTriggerTemperature" ] = highSpeedTriggerTemperature;
-	jsonOut[ "isOverHeating" ] = isOverHeating;
+	if( showPrimayDisplay || isOverHeating ){ // draw to both displays during critical state too
 
-	serializeJson( jsonOut, Serial );
-	Serial.println(); // new line to separate json entries
+		memcpy( displayPrimary.getBuffer(), displayRemote.getBuffer(), 1024 );
+		displayPrimary.display();
 
-
-	if( showPrimayDisplay || isOverHeating ){
-
-		render( displayPrimary );
 	}else if( wipeOnce  ){
 
 		wipeDisplay( displayPrimary );
 		wipeOnce = false;
 	}
-
-	render( displayRemote );
 }
 
 void render( Adafruit_SSD1306 &display ){
@@ -243,10 +268,11 @@ void render( Adafruit_SSD1306 &display ){
 	}
 }
 
-void advanceAnimationTicks(){
+void advanceUpdateTicks(){
 
 	unsigned long currentMillis = millis();
 	advanceGraph = false;
+	shouldReadTemperature = false;
 
 	bool graphAnimationTick = ( previousMillisGraphAnimation == 0 || currentMillis - previousMillisGraphAnimation > GRAPH_ANIMATION_INTERVAL );
 
@@ -283,8 +309,32 @@ void advanceAnimationTicks(){
 	if( previousMillisNoTempAlert == 0 || currentMillis - previousMillisNoTempAlert > NO_TEMPERATURE_ALERT_INTERVAL ){
 
 		previousMillisNoTempAlert = currentMillis;
-		alert = !alert;
+		noTemperatureDataAlertUI = !noTemperatureDataAlertUI;
 	}
+
+	if( previousMillisTempRead == 0 || currentMillis - previousMillisTempRead > tempRequestDelayMillis ){
+
+		previousMillisTempRead = currentMillis;
+		shouldReadTemperature = true;
+	}
+}
+
+void writeToSerial(){
+
+	jsonOut[ "currentTemperatureReading" ] = currentTemperatureReading;
+	jsonOut[ "lowSpeedFanShouldRun" ] = lowSpeedFanShouldRun;
+	jsonOut[ "highSpeedFanShouldRun" ] = highSpeedFanShouldRun;
+	jsonOut[ "isBufferCooling" ] = isBufferCooling;
+	jsonOut[ "isHighOverride" ] = isHighOverride;
+	jsonOut[ "isLowOverride" ] = isLowOverride;
+	jsonOut[ "externalRequestToRunLowSpeed" ] = externalRequestToRunLowSpeed;
+	jsonOut[ "isTemperatureReadingValid" ] = isTemperatureReadingValid;
+	jsonOut[ "lowSpeedTriggerTemperature" ] = lowSpeedTriggerTemperature;
+	jsonOut[ "highSpeedTriggerTemperature" ] = highSpeedTriggerTemperature;
+	jsonOut[ "isOverHeating" ] = isOverHeating;
+
+	serializeJson( jsonOut, Serial );
+	Serial.println(); // new line to separate json entries
 }
 
 void updateDisplayReading(){
@@ -322,7 +372,6 @@ void determineFanRelayState(){
 		externalRequestToRunLowSpeed = !digitalRead( AC_STATE_PIN );
 	#endif
 
-	isTemperatureReadingValid = currentTemperatureReading > SENSOR_MIN_TEMPERATURE;
 	isOverHeating = isTemperatureReadingValid && currentTemperatureReading >= OVERHEAT_TEMPERATURE;
 	wipeOnce = isOverHeating ? true : wipeOnce;
 
@@ -524,42 +573,55 @@ void updateMemory( byte address, byte value ){
 
 void calculateCoolantTemperature(){
 
-	// Async request for temperature
-	temperatureSensor.setWaitForConversion( false );
-	temperatureSensor.requestTemperatures();
-	temperatureSensor.setWaitForConversion( true );
+	// debouounce temperature reading to reduce errors and misreads. the sensor can handle about a 750 MS update interval
+	if( !shouldReadTemperature ){ return; }
+
 
 	#ifdef DEBUG
 		// DEBUG : simulate temp reading
 		float reading = map( analogRead( AC_STATE_PIN ), 0, 4095, 0, MAX_DISPLAY_TEMPERATURE ); // read from a potentiometer
 	#else
-		// actual temp reading
+		// Get latest Temperature Reading from the sensor
 		float reading = temperatureSensor.getTempCByIndex(0);
+
+		// Async request for next temperature reading to allow sensor to perform conversion without blocking code execution, per datasheet timing recommendations based on resolution
+		temperatureSensor.requestTemperatures();
+
 	#endif
 
+	// Be tolerant of read errors. If more than a set number of readings is recorded, set isTemperatureReadingValid until we get a valid reading.
+	if( (int)reading == DEVICE_DISCONNECTED_C ){
 
-	if( reading < SENSOR_MIN_TEMPERATURE ){
+		numberOfBadReadings++;
 
-		currentTemperatureReading = reading;
-		return;
-	}
+		if( numberOfBadReadings >= NUMBER_OF_BAD_READINGS_THRESHOLD && isTemperatureReadingValid ){
 
-	rawTotal -= readings[ readIndex ];
-	readings[ readIndex ] = reading; // actual as-measured
-	// readings[ readIndex ] = 100.0; // DEBUG -> fixed temp value
-	// readings[ readIndex ] = ( random()%3 == 0 ) ? MIN_DISPLAY_TEMPERATURE : MAX_DISPLAY_TEMPERATURE; // DEBUG -> random raw boost value
+			noTemperatureDataAlertUI = true;
+			isTemperatureReadingValid = false;
+		}
+	}else{
 
-	rawTotal += readings[ readIndex ];
-	readIndex = ( readIndex + 1 ) % NUM_READINGS; // wrap if at end of total samples
+		numberOfBadReadings = 0;
+		isTemperatureReadingValid = true;
+		noTemperatureDataAlertUI = false;
 
-	if( readIndex >= NUM_READINGS ){
+		rawTotal -= readings[ readIndex ];
+		readings[ readIndex ] = reading; // actual as-measured
+		// readings[ readIndex ] = 100.0; // DEBUG -> fixed temp value
+		// readings[ readIndex ] = ( random()%3 == 0 ) ? MIN_DISPLAY_TEMPERATURE : MAX_DISPLAY_TEMPERATURE; // DEBUG -> random raw boost value
 
-		readIndex = 0;
+		rawTotal += readings[ readIndex ];
+		readIndex = ( readIndex + 1 ) % NUM_READINGS; // wrap if at end of total samples
+
+		if( readIndex >= NUM_READINGS ){
+
+			readIndex = 0;
+		}
 	}
 
 	float rawValue = rawTotal / NUM_READINGS;
 	currentTemperatureReading = constrain( rawValue, SENSOR_MIN_TEMPERATURE, MAX_DISPLAY_TEMPERATURE );
-
+	writeToSerial();
 	delay(1);
 }
 
@@ -641,7 +703,7 @@ void drawNumeric( byte xOffset, byte yOffset, byte decimal, String label, Adafru
 		!( lowSpeedFanShouldRun || highSpeedFanShouldRun )
 	){
 
-		display.setTextColor( !alert );
+		display.setTextColor( !noTemperatureDataAlertUI );
 		display.setCursor( 0, yOffset + 22 );
 		display.print( F(" NO TEMPERATURE DATA") );
 		display.setTextColor( WHITE );
@@ -862,4 +924,28 @@ void drawRotatedTriangle(int sign, float tipX, float tipY, float theta, float bl
 		roundf( tipY + rt2Y ),
 		WHITE
 	);
+}
+
+void slowType( String text, int delayTime, bool newLine ){
+
+	if( newLine ){
+		displayPrimary.setCursor(0, lastLine );
+		displayRemote.setCursor(0, lastLine );
+		lastLine += LAST_LINE_INDENT;
+	}
+
+	for( byte i = 0; i < text.length(); i++ ){
+
+		displayPrimary.print( text[ i ] );
+		displayPrimary.display();
+
+		displayRemote.print( text[ i ] );
+		displayRemote.display();
+		delay( delayTime );
+	}
+}
+
+void slowPrintSuccessOrFail( bool condition ){
+
+	condition ? slowType( F("OK"), 50, false ) : slowType( F("FAIL"), 50, false );
 }
