@@ -2,7 +2,7 @@
 
 #include "EEPROM_FLASH.h" // RP2040 does not support EEPROM natively, nor SAMD EEPROM emulation
 #include <ArduinoJson.h>  // JSON over Serial for telemetry
-#include <ezButton.h>
+#include "AnalogLadderButton.h"
 #include <DallasTemperature.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
@@ -11,25 +11,30 @@
 
 #define OLED_RESET -1 // [ ALIAS ] analog pin to reset the OLED display\
 
-// #define DEBUG
+#define DEBUG
 
 // Sensor Input Pins
 
 // DEBUG analog pin to read simulated temperature (use potentiometer on this pin)
 #ifdef DEBUG
-	#define AC_STATE_PIN A3 // [ ALIAS ] analog pin to read simulated temperature. borrow A/C state pin b/c XIAO  has limited analog pins
+	#define AC_STATE_PIN A0 // [ ALIAS ] analog pin to read simulated temperature. borrow A/C state pin b/c XIAO  has limited analog pins
 #else
-	#define AC_STATE_PIN D3 // [ ALIAS ] digtial pin to read A/C fan state
+	#define AC_STATE_PIN D6 // [ ALIAS ] digtial pin to read A/C fan state
 #endif
 
 #define TEMP_SENSE_PIN D8 // [ INT ] digital pin to read Temperature data
 
 // User Input Pins
-#define ENTER_BUTTON_PIN D0 // [ INT ]  digital read pin for button inputs
-#define DOWN_BUTTON_PIN D1 // [ INT ]  digital read pin for button inputs
-#define UP_BUTTON_PIN D2 // [ INT ]  digital read pin for button inputs
-#define LOW_FAN_SPEED_OVERRIDE_PIN D6 // [ INT ]  digital input pin for LOW speed override
-#define HIGH_FAN_SPEED_OVERRIDE_PIN D7 // [ INT ]  digital imput pin for HIGH speed override
+#define NUMBER_OF_INPUT_BUTTONS 3 // [ INT ] number of buttons in the resistor ladder
+#define ENTER_KEY 1 // [ INT ] button index for enter button on the ezAnalogKeypad
+#define UP_KEY 2 // [ INT ] button index for up button on the ezAnalogKeypad
+#define DOWN_KEY 3 // [ INT ] button index for down button on the ezAnalogKeypad
+#define BUTTONS_INPUT_PIN A2 // [ INT ]  digital read pin for all button inputs ADC resistor laddder
+
+#define ACC_SIGNAL D7 // [ INT ]  digital read pin for determining vehicle accessory power state
+#define POWER_HOLD_PIN D0 // [ INT ]  digital output pin for holding relay to maintain power when ACC signal is lost
+#define LOW_FAN_SPEED_OVERRIDE_PIN D1 // [ INT ]  digital input pin for LOW speed override
+#define HIGH_FAN_SPEED_OVERRIDE_PIN D3 // [ INT ]  digital input pin for HIGH speed override
 
 // Controller Output Pins
 #define LOW_FAN_SPEED_PIN D9 // [ INT ]  digital out pin for LOW speed fan trigger
@@ -75,9 +80,19 @@ Adafruit_SSD1306 displayRemote( DISPLAY_WIDTH, DISPLAY_HEIGHT, &Wire, OLED_RESET
 
 OneWire oneWire( TEMP_SENSE_PIN );
 DallasTemperature temperatureSensor( &oneWire );
-ezButton enterButton( ENTER_BUTTON_PIN );
-ezButton upButton( UP_BUTTON_PIN );
-ezButton downButton( DOWN_BUTTON_PIN );
+
+// analogRead at 10 bit resolution reads on button ladder yield raw values:
+// no-pres: 1023, enter: 679, down: 509, up: 4
+
+// improved resolution by using 12 bit reads and adjusting resistor values to yield more distinct readings:
+// no-press: 4000, enter: 2716, down: 2040, up: 18
+
+int thresholds[ NUMBER_OF_INPUT_BUTTONS ] = { 18, 2040, 2716 }; // raw values at which the buttons are triggered, in ascending order, not including the no-press state ( 4000 ) and should be calibrated to a specific resistor ladder and analog read resolution
+AnalogLadder ladder( BUTTONS_INPUT_PIN, thresholds, NUMBER_OF_INPUT_BUTTONS ); // analog pin, array of thresholds, number of thresholds
+
+AnalogLadderButton upButton( ladder, 1 ); // analog pin, button ID, low threshold, high threshold
+AnalogLadderButton downButton( ladder, 2 );
+AnalogLadderButton enterButton( ladder, 3 );
 
 // States
 
@@ -115,7 +130,7 @@ unsigned long pressedTime = 0;
 unsigned long releasedTime = 0;
 unsigned long editModeTime = 0;
 unsigned long showPrimayDisplayTime = 0;
-byte lastLine = 0;
+byte lastLine = 0; // [ PIXELS ] used to track where the last line of text was printed for slowType() and provide consistent spacing for new lines
 
 unsigned long previousMillisTempRead = 0;
 unsigned long tempRequestDelayMillis = 0;
@@ -159,10 +174,12 @@ const unsigned char warningIcon [] PROGMEM = { // 30x30
 
 void setup(){
 
-	#ifdef DEBUG
-		// DEBUG set analog read resolution to 12 bits (0-4095)
-		analogReadResolution(12);
-	#endif
+	// #ifdef DEBUG
+	// 	// DEBUG set analog read resolution to 12 bits (0-4095)
+	// 	analogReadResolution(12);
+	// #endif
+	// Throws off analog ladder button readings, so maybe set to 10 bits for better stability on button presses
+	analogReadResolution( 12 );
 
 	displayPrimary.begin(SSD1306_SWITCHCAPVCC, 0x3C);
 	wipeDisplay( displayPrimary );
@@ -190,19 +207,28 @@ void setup(){
 	previousMillisTempRead= millis();
 
 	slowType( F("CONFIG INPUTS >"), 20, true );
-	enterButton.setDebounceTime( 10 );
-	upButton.setDebounceTime( 10 );
-	downButton.setDebounceTime( 10 );
+
+	ladder.begin();
+
+	enterButton.begin();
+	upButton.begin();
+	downButton.begin();
 
 	Wire.setClock(1000000L);
 
-	pinMode(AC_STATE_PIN, INPUT);
-	pinMode(TEMP_SENSE_PIN, INPUT);
-	pinMode(LOW_FAN_SPEED_OVERRIDE_PIN, INPUT);
-	pinMode(HIGH_FAN_SPEED_OVERRIDE_PIN, INPUT);
+	// Onboard
+	pinMode(BUTTONS_INPUT_PIN, INPUT);
 
-	pinMode(LOW_FAN_SPEED_PIN, OUTPUT);
-	pinMode(HIGH_FAN_SPEED_PIN, OUTPUT);
+	// Vehicle Signals
+	pinMode( AC_STATE_PIN, INPUT );
+	pinMode( ACC_SIGNAL, INPUT );
+	pinMode( TEMP_SENSE_PIN, INPUT );
+	pinMode( LOW_FAN_SPEED_OVERRIDE_PIN, INPUT );
+	pinMode( HIGH_FAN_SPEED_OVERRIDE_PIN, INPUT );
+
+	pinMode( LOW_FAN_SPEED_PIN, OUTPUT );
+	pinMode( HIGH_FAN_SPEED_PIN, OUTPUT );
+	pinMode( POWER_HOLD_PIN, OUTPUT );
 
 	Serial.begin( 115200 );
 
@@ -430,9 +456,19 @@ void listenToButtonPushes(){
 	bool isButtonPressed = false;
 	bool isButtonReleased = false;
 
-	enterButton.loop();
-	upButton.loop();
-	downButton.loop();
+	ladder.update();
+
+	enterButton.update();
+	upButton.update();
+	downButton.update();
+
+	bool enterButtonIsPressed = enterButton.isPressed();
+	bool upButtonIsPressed = upButton.isPressed();
+	bool downButtonIsPressed = downButton.isPressed();
+
+	bool enterButtonIsReleased = enterButton.isReleased();
+	bool upButtonIsReleased = upButton.isReleased();
+	bool downButtonIsReleased = downButton.isReleased();
 
 	if(( isEditingLowSpeedTrigger || isEditingHighSpeedTrigger ) && ( millis() - editModeTime ) > LEAVE_EDIT_MODE_TIME ) {
 
@@ -446,16 +482,15 @@ void listenToButtonPushes(){
 		wipeOnce = true;
 	}
 
-	if( enterButton.isPressed() ){
+	if( enterButtonIsPressed ){
 
 		buttonPressed = 1;
 		isButtonPressed = true;
-	}else if( upButton.isPressed() ){
+	}else if( upButtonIsPressed ){
 
 		buttonPressed = 2;
 		isButtonPressed = true;
-	} else if( downButton.isPressed() ){
-
+	} else if( downButtonIsPressed ) {
 		buttonPressed = 3;
 		isButtonPressed = true;
 	}
@@ -467,15 +502,15 @@ void listenToButtonPushes(){
 		isLongPressDetected = false;
 	}
 
-	if( enterButton.isReleased() ) {
+	if( enterButtonIsReleased ) {
 
 		buttonReleased = 1;
 		isButtonReleased = true;
-	}else if( upButton.isReleased() ) {
+	}else if( upButtonIsReleased ) {
 
 		buttonReleased = 2;
 		isButtonReleased = true;
-	}else if( downButton.isReleased() ) {
+	}else if( downButtonIsReleased ) {
 
 		buttonReleased = 3;
 		isButtonReleased = true;
@@ -489,7 +524,6 @@ void listenToButtonPushes(){
 		if(( releasedTime - pressedTime ) < MAX_SHORT_PRESS_TIME ){
 
 			changeProgramState( buttonPressed, "short" );
-
 		}
 
 		buttonReleased = 0;
@@ -621,7 +655,7 @@ void calculateCoolantTemperature(){
 
 	float rawValue = rawTotal / NUM_READINGS;
 	currentTemperatureReading = constrain( rawValue, SENSOR_MIN_TEMPERATURE, MAX_DISPLAY_TEMPERATURE );
-	writeToSerial();
+	// writeToSerial(); todo turn on
 	delay(1);
 }
 
