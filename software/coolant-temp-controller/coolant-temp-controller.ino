@@ -18,22 +18,22 @@
 
 // DEBUG analog pin to read simulated temperature (use potentiometer on this pin)
 #ifdef DEBUG
-	#define AC_STATE_PIN A1 // [ ALIAS ] analog pin to read simulated temperature. borrow button pin b/c XIAO has limited analog pins
+	#define TEMP_SENSE_PIN A0 // [ ALIAS ] analog pin to read simulated temperature from a potentiometer sweeping 0 - 3.3v
 #else
-	#define AC_STATE_PIN D6 // [ ALIAS ] digtial pin to read A/C fan state
+	#define TEMP_SENSE_PIN D0 // [ INT ] digital pin to read Temperature data
 #endif
 
-#define TEMP_SENSE_PIN D8 // [ INT ] digital pin to read Temperature data
+#define AC_STATE_PIN D6 // [ ALIAS ] digtial pin to read A/C fan state
 
 // User Input Pins
 #define NUMBER_OF_INPUT_BUTTONS 3 // [ INT ] number of buttons in the resistor ladder
 #define ENTER_KEY 1 // [ INT ] button index for enter button on the ezAnalogKeypad
 #define UP_KEY 2 // [ INT ] button index for up button on the ezAnalogKeypad
 #define DOWN_KEY 3 // [ INT ] button index for down button on the ezAnalogKeypad
-#define BUTTONS_INPUT_PIN A2 // [ INT ]  digital read pin for all button inputs ADC resistor laddder
+#define BUTTONS_INPUT_PIN A2 // [ INT ]  analog read pin for all button inputs ADC resistor laddder
 
 #define ACC_SIGNAL D7 // [ INT ]  digital read pin for determining vehicle accessory power state
-#define POWER_HOLD_PIN D0 // [ INT ]  digital output pin for holding relay to maintain power when ACC signal is lost
+#define POWER_HOLD_PIN D8 // [ INT ]  digital output pin for holding relay to maintain power when ACC signal is lost
 #define LOW_FAN_SPEED_OVERRIDE_PIN D1 // [ INT ]  digital input pin for LOW speed override
 #define HIGH_FAN_SPEED_OVERRIDE_PIN D3 // [ INT ]  digital input pin for HIGH speed override
 
@@ -54,7 +54,11 @@
 #define GRAPH_ANIMATION_INTERVAL 500 // [ MILLISECONDS ] to animate historical graph and record another datum
 #define NO_TEMPERATURE_ALERT_INTERVAL 400 // [ MILLISECONDS ] between alert flashes
 #define LEAVE_EDIT_MODE_TIME 5000 // [ MILLISECONDS ] before disabling editMode due to inactivity
-#define PRIMARY_DISPLAY_SHOW_TIME 30000 // [ MILLISECONDS ] before wiping off primary display
+#ifdef DEBUG
+	#define PRIMARY_DISPLAY_SHOW_TIME INFINITY // [ MILLISECONDS ] before wiping off primary
+#else
+	#define PRIMARY_DISPLAY_SHOW_TIME 30000 // [ MILLISECONDS ] before wiping off primary display
+#endif
 #define EASE_COEFFICIENT 0.15 // [ DECIMAL ] : between 0-1 strength with which to dampen title scrolling, 0: strong damping 1: no damping
 #define LAST_LINE_INDENT 10 // [ PIXELS ] default padding for next line printed, used by slowType()
 
@@ -73,17 +77,18 @@
 // Sensor Configuration and Timing
 #define TEMPERATURE_SENSOR_RESOLUTION 9 // [ BITS ] : resolution of temperature sensor, higher is slower but more accurate, 9-12 bits available for this sensor
 #define TEMPERATURE_SENSOR_READ_INTERVAL 750 // [ MILLISECONDS ] : interval at which to read the temperature sensor
-// #define TEMP_CONVERSION_MS 1000 // [ MILLISECONDS ] : time it takes for the temperature sensor to perform a conversion
-#define NUMBER_OF_BAD_READINGS_THRESHOLD 10 // [ INT ] : number of consecutive bad readings before we alert the user to no temperature data and set isTemperatureReadingValid
+#define NUMBER_OF_BAD_READINGS_THRESHOLD 100 // [ INT ] : number of consecutive bad readings before we alert the user to no temperature data and set isTemperatureReadingValid todo: try 50-100 bad reading threshold
 
 Adafruit_SSD1306 displayPrimary( DISPLAY_WIDTH, DISPLAY_HEIGHT, &Wire, OLED_RESET );
 Adafruit_SSD1306 displayRemote( DISPLAY_WIDTH, DISPLAY_HEIGHT, &Wire, OLED_RESET );
 
-OneWire oneWire( TEMP_SENSE_PIN );
-DallasTemperature temperatureSensor( &oneWire );
+#ifndef DEBUG
+	OneWire oneWire( TEMP_SENSE_PIN );
+	DallasTemperature temperatureSensor( &oneWire );
+#endif
 
 // analogRead at 10 bit resolution reads on button ladder yield raw values:
-// no-pres: 1023, enter: 679, down: 509, up: 4
+// no-press: 1023, enter: 679, down: 509, up: 4
 
 // improved resolution by using 12 bit reads and adjusting resistor values to yield more distinct readings:
 // no-press: 4000, enter: 2716, down: 2040, up: 18
@@ -96,16 +101,8 @@ AnalogLadderButton downButton( ladder, 2 );
 AnalogLadderButton enterButton( ladder, 3 );
 
 // forward declarations
-void drawProgressFilledCircle(
-	Adafruit_SSD1306 &display,
-	int16_t x, int16_t y,
-	int16_t radius,
-	float progress,
-	bool invert,
-	uint16_t color
-);
 
-void drawDonutSegmentsAA(
+void drawDonutSegments(
 	Adafruit_SSD1306 &display,
 	int cx, int cy,
 	int innerRadius,
@@ -127,7 +124,7 @@ enum VehicleState {
 VehicleState vehicleState = STATE_OFF;
 
 bool isVehicleOn = false;
-bool previouIsVehicleOn = false;
+bool previousIsVehicleOn = false;
 
 byte coolDownExtensions = 0;
 byte vehiclePowerCycles = 0;
@@ -136,13 +133,13 @@ unsigned long stateStartMillis = 0;
 unsigned long cooldownEndMillis = 0;
 uint32_t cooldownStartMillis;
 
-const unsigned long COOLDOWN_TIME_MS = 5000;
-const unsigned long EXTEND_TIME_MS   = 2000;
+const unsigned long COOLDOWN_TIME_MS = 120000; // [ MILLISECONDS ] default cooldown time before accounting for extensions // 2 minutes should suffice
+const unsigned long EXTEND_TIME_MS = 120000; // [ MILLISECONDS ] for each cooldown extension // 2 minutes should suffice
 
-const byte MAX_EXTENSIONS = 4;
+const byte MAX_EXTENSIONS = 8;
 
 const float OPERATING_TEMP = 90.5;
-const float OVERHEAT_TEMP  = 112;
+const float OVERHEAT_TEMP = 112.0;
 
 byte remainingExtensions;
 byte maxExtensionsThisCycle = 0;
@@ -172,6 +169,7 @@ bool isLowOverride = false;
 bool externalRequestToRunLowSpeed = true;
 bool isTemperatureReadingValid = false;
 bool isOverHeating = false;
+bool isHeatSoakProbable = false;
 bool shouldKeepControllerAlive = false;
 bool accRising = false;
 bool accFalling = false;
@@ -246,13 +244,19 @@ void setup(){
 
 	slowType( F("CONTROLLER STARTING >"), 20, true );
 
-	// Configure Temperature Sensor
-	slowType( F("BRINGING ONLINE >"), 20, true );
-	temperatureSensor.begin();
-	temperatureSensor.setResolution( TEMPERATURE_SENSOR_RESOLUTION );
-	temperatureSensor.setWaitForConversion( false );
-	temperatureSensor.requestTemperatures();
-	slowPrintSuccessOrFail( temperatureSensor.getDeviceCount() > 0);
+	#ifdef DEBUG
+
+		slowType( F("DEBUG MODE >"), 20, true );
+		slowPrintSuccessOrFail( true );
+	#else
+		// Configure Temperature Sensor
+		slowType( F("BRINGING ONLINE >"), 20, true );
+		temperatureSensor.begin();
+		temperatureSensor.setResolution( TEMPERATURE_SENSOR_RESOLUTION );
+		temperatureSensor.setWaitForConversion( false );
+		temperatureSensor.requestTemperatures();
+		slowPrintSuccessOrFail( temperatureSensor.getDeviceCount() > 0);
+	#endif
 
 	tempRequestDelayMillis = TEMPERATURE_SENSOR_READ_INTERVAL / ( 1 << ( 12 - TEMPERATURE_SENSOR_RESOLUTION )); // calculate delay based on sensor resolution, per datasheet timing
 	previousMillisTempRead= millis();
@@ -291,7 +295,7 @@ void setup(){
 	storedLowSpeedTriggerTemperature = EEPROM_FLASH::read( 0 );
 	storedHighSpeedTriggerTemperature = EEPROM_FLASH::read( 1 );
 
-	lowSpeedTriggerTemperature =  ( storedLowSpeedTriggerTemperature != 255 ) ? storedLowSpeedTriggerTemperature : 93;// [ DEGREES ] : ( Celcius ) : when to kick on low speed relay
+	lowSpeedTriggerTemperature = ( storedLowSpeedTriggerTemperature != 255 ) ? storedLowSpeedTriggerTemperature : 93;// [ DEGREES ] : ( Celcius ) : when to kick on low speed relay
 	highSpeedTriggerTemperature = ( storedHighSpeedTriggerTemperature != 255 ) ? storedHighSpeedTriggerTemperature : 105; // || 105;// [ DEGREES ] : ( Celcius ) : when to kick on high speed relay
 	optimalTemperature = constrain( lowSpeedTriggerTemperature - 2, MIN_DISPLAY_TEMPERATURE, highSpeedTriggerTemperature ); // [ DEGREES ] : ( Celcius ) : the target to which fans should cool before turning off
 
@@ -315,10 +319,10 @@ void loop(){
 
 	isVehicleOn = !digitalRead(ACC_SIGNAL);
 
-	accRising = (!previouIsVehicleOn && isVehicleOn);
-	accFalling = (previouIsVehicleOn && !isVehicleOn);
+	accRising = (!previousIsVehicleOn && isVehicleOn); // todo: may be ok to remove, since updateVehicleState uses a local variable
+	accFalling = (previousIsVehicleOn && !isVehicleOn); // todo: may be ok to remove, since updateVehicleState uses a local variable
 
-	previouIsVehicleOn = isVehicleOn;
+	previousIsVehicleOn = isVehicleOn;
 
 	calculateCoolantTemperature();
 
@@ -327,13 +331,8 @@ void loop(){
 	updatePowerHoldState();
 	updateFanRelayState();
 
-	// todo: check if this is safe to remove
-	bool lowSpeedFanHeatSoak = ( vehicleState == STATE_COOLDOWN ) && //|| vehicleState == STATE_EXTEND) &&
-		(currentTemperatureReading >= OPERATING_TEMPERATURE);
 
-
-
-	digitalWrite( LOW_FAN_SPEED_PIN, lowSpeedFanShouldRun || lowSpeedFanHeatSoak );
+	digitalWrite( LOW_FAN_SPEED_PIN, lowSpeedFanShouldRun );
 	digitalWrite( HIGH_FAN_SPEED_PIN, highSpeedFanShouldRun );
 	digitalWrite( POWER_HOLD_PIN, shouldKeepControllerAlive );
 
@@ -383,7 +382,7 @@ void advanceUpdateTicks(){
 		int scaledLevel = round((float) SCROLLING_GRAPH_HEIGHT *
 			((( currentDisplayReading - MIN_DISPLAY_TEMPERATURE ) / ( MAX_DISPLAY_TEMPERATURE - MIN_DISPLAY_TEMPERATURE ))));
 
-			if( scaledLevel <= 0 ){
+		if( scaledLevel <= 0 ){
 
 			scaledLevel = 0;
 		}
@@ -431,6 +430,7 @@ void writeToSerial(){
 	jsonOut[ "lowSpeedTriggerTemperature" ] = lowSpeedTriggerTemperature;
 	jsonOut[ "highSpeedTriggerTemperature" ] = highSpeedTriggerTemperature;
 	jsonOut[ "isOverHeating" ] = isOverHeating;
+	jsonOut[ "isHeatSoakProbable" ] = isHeatSoakProbable;
 
 	serializeJson( jsonOut, Serial );
 	Serial.println(); // new line to separate json entries
@@ -461,25 +461,23 @@ void updateFanRelayState(){
 	// shouldBufferCoolLow -- Run LOW speed fan relay until OPTIMAL temperature is reached
 	// shouldBufferCoolHigh -- Run HIGH speed fan relay until OPTIMAL temperature is reached
 
-
 	//NOTE: Inputs are pulled up to 3.3V, so invert logic for digitalRead()
-	#ifdef DEBUG
-		// DEBUG disble digital reads to allow simulated temperature (analog read from same pin)
-		externalRequestToRunLowSpeed = false;
-	#else
-		// whether we should run the fans on external user or ECU request
-		externalRequestToRunLowSpeed = !digitalRead( AC_STATE_PIN );
-	#endif
+
+	// whether we should run the fans on external user or ECU request
+	externalRequestToRunLowSpeed = !digitalRead( AC_STATE_PIN );
 
 	isOverHeating = isTemperatureReadingValid && currentTemperatureReading >= OVERHEAT_TEMPERATURE;
-	wipeOnce = isOverHeating ? true : wipeOnce;
+	wipeOnce = isOverHeating ? true : wipeOnce; // allow primary display to light up when overheating as an alert priority condition
 
-	// handle manual overrides first
+	isHeatSoakProbable = ( vehicleState == STATE_COOLDOWN ) && // vehicle has been turned off
+		(currentTemperatureReading > optimalTemperature); // temperature is high enough to warrant cooling during heat soak
+
+	// handle manual overrides
 	highSpeedFanShouldRun = isHighOverride = !digitalRead( HIGH_FAN_SPEED_OVERRIDE_PIN );
 	lowSpeedFanShouldRun = isLowOverride = !digitalRead( LOW_FAN_SPEED_OVERRIDE_PIN );
 
-	// Manual Override, set relevant flags, and bail early
-	if( ( isLowOverride || isHighOverride ) && vehicleState != STATE_COOLDOWN ){
+	// Manual Override: set relevant flags, and bail early
+	if( ( isLowOverride || isHighOverride && !isHeatSoakProbable ) ){
 
 		fanUIShouldSpin = true;
 		return;
@@ -504,7 +502,9 @@ void updateFanRelayState(){
 
 		// fan activation is mutually exclusive. We also care bout the vehicle state here
 		// during cooldown, only the lowspeed fan should be allowed to spin
-		highSpeedFanShouldRun = !( lowSpeedFanShouldRun = vehicleState == STATE_COOLDOWN ? true : false );
+		// highSpeedFanShouldRun = !( lowSpeedFanShouldRun = vehicleState == STATE_COOLDOWN ? true : false ); // previous
+		highSpeedFanShouldRun = !( lowSpeedFanShouldRun = isHeatSoakProbable );
+
 		shouldBufferCoolHigh = true; // Controller flag for buffered cooling at HIGH speed to OPTIMAL temperature
 		fanUIShouldSpin = true; // UI flag for Fan Animation
 
@@ -513,11 +513,13 @@ void updateFanRelayState(){
 	// - external source requested and system is warm enough to supplement cooling
 	// - temp sensor is not reporting, but ECU is requesting supplemental cooling ie. A/C trigger
 	// - LOW speed is already triggerd and should cool below the LOW trigger before turning off
+	// - cooldown state with heat soak likelihood
 	}else if(
 		( currentTemperatureReading >= lowSpeedTriggerTemperature ) ||
 		( externalRequestToRunLowSpeed && currentTemperatureReading > optimalTemperature ) ||
 		( externalRequestToRunLowSpeed && !isTemperatureReadingValid ) ||
-		shouldBufferCoolLow
+		shouldBufferCoolLow ||
+		isHeatSoakProbable
 	){
 
 		highSpeedFanShouldRun = !( lowSpeedFanShouldRun = true );
@@ -530,13 +532,12 @@ byte computeMaxExtensions( float temperature ){
 
 	if( temperature  < OPERATING_TEMPERATURE ) return 0;
 
-	// linear ramp between operating and overheat
-	float t = ( temperature  - OPERATING_TEMPERATURE ) / ( OVERHEAT_TEMPERATURE - OPERATING_TEMPERATURE );
+	// normalize 0-1 between operating and overheat temperature
+	float normalized = ( temperature  - OPERATING_TEMPERATURE ) / ( OVERHEAT_TEMPERATURE - OPERATING_TEMPERATURE );
 
-	t = clamp01(t);
+	normalized = clamp01( normalized );
 
-	// scale to your max allowed
-	return (byte)roundf( t * MAX_EXTENSIONS );
+	return (byte)roundf( normalized * MAX_EXTENSIONS );
 }
 
 
@@ -565,6 +566,11 @@ byte computeMaxExtensions( float temperature ){
 // - AGGRESSIVE cooling run for the MAXIMUM_COOLDOWN_RUN_TIME
 // absolute run time never exceed fixed duration (say 10 minutes)
 
+// TODO: consider updating extensions dynamically.
+// eg. If the temperature drops below the low speed trigger and a full extension has expired,
+// drop the remainng extension time to something trivial like 10 seconds
+// This should reduce unnecessary monitoring
+
 void updateVehicleState(){
 
 	static bool prevACC = false;
@@ -589,7 +595,7 @@ void updateVehicleState(){
 		cooldownEndMillis = now + COOLDOWN_TIME_MS;
 
 		// snapshot extensions at start of cooldown session
-		maxExtensionsThisCycle = computeMaxExtensions(currentTemperatureReading);
+		maxExtensionsThisCycle = computeMaxExtensions( currentTemperatureReading );
 		remainingExtensions = maxExtensionsThisCycle;
 	}
 
@@ -669,7 +675,7 @@ void updateVehicleState(){
 
 void updatePowerHoldState(){
 
-	shouldKeepControllerAlive =( vehicleState == STATE_RUN) || ( vehicleState == STATE_COOLDOWN);
+	shouldKeepControllerAlive = ( vehicleState == STATE_RUN ) || ( vehicleState == STATE_COOLDOWN );
 }
 
 void initializeVehicleState(){
@@ -684,7 +690,7 @@ void initializeVehicleState(){
 
 	// read raw ACC once at boot
 	isVehicleOn = !digitalRead( ACC_SIGNAL );
-	previouIsVehicleOn = isVehicleOn;
+	previousIsVehicleOn = isVehicleOn;
 
 	if( isVehicleOn ){
 
@@ -716,13 +722,13 @@ void listenToButtonPushes(){
 	bool upButtonIsReleased = upButton.isReleased();
 	bool downButtonIsReleased = downButton.isReleased();
 
-	if(( isEditingLowSpeedTrigger || isEditingHighSpeedTrigger ) && ( millis() - editModeTime ) > LEAVE_EDIT_MODE_TIME ) {
+	if(( isEditingLowSpeedTrigger || isEditingHighSpeedTrigger ) && ( millis() - editModeTime ) > LEAVE_EDIT_MODE_TIME ){
 
 		isEditingLowSpeedTrigger = false;
 		isEditingHighSpeedTrigger = false;
 	}
 
-	if( showPrimayDisplay && ( millis() - showPrimayDisplayTime ) > PRIMARY_DISPLAY_SHOW_TIME ) {
+	if( showPrimayDisplay && ( millis() - showPrimayDisplayTime ) > PRIMARY_DISPLAY_SHOW_TIME ){
 
 		showPrimayDisplay = false;
 		wipeOnce = true;
@@ -737,6 +743,7 @@ void listenToButtonPushes(){
 		buttonPressed = 2;
 		isButtonPressed = true;
 	} else if( downButtonIsPressed ) {
+
 		buttonPressed = 3;
 		isButtonPressed = true;
 	}
@@ -859,7 +866,7 @@ void calculateCoolantTemperature(){
 
 	#ifdef DEBUG
 		// DEBUG : simulate temp reading
-		float reading = map( analogRead( AC_STATE_PIN ), 0, 4095, 0, MAX_DISPLAY_TEMPERATURE ); // read from a potentiometer
+		float reading = map( analogRead( TEMP_SENSE_PIN ), 0, 4095, 0, MAX_DISPLAY_TEMPERATURE ); // read from a potentiometer
 	#else
 		// Get latest Temperature Reading from the sensor
 		float reading = temperatureSensor.getTempCByIndex(0);
@@ -888,7 +895,7 @@ void calculateCoolantTemperature(){
 		rawTotal -= readings[ readIndex ];
 		readings[ readIndex ] = reading; // actual as-measured
 		// readings[ readIndex ] = 100.0; // DEBUG -> fixed temp value
-		// readings[ readIndex ] = ( random()%3 == 0 ) ? MIN_DISPLAY_TEMPERATURE : MAX_DISPLAY_TEMPERATURE; // DEBUG -> random raw boost value
+		// readings[ readIndex ] = ( random()%3 == 0 ) ? MIN_DISPLAY_TEMPERATURE : MAX_DISPLAY_TEMPERATURE; // DEBUG -> random raw value
 
 		rawTotal += readings[ readIndex ];
 		readIndex = ( readIndex + 1 ) % NUM_READINGS; // wrap if at end of total samples
@@ -901,30 +908,30 @@ void calculateCoolantTemperature(){
 
 	float rawValue = rawTotal / NUM_READINGS;
 	currentTemperatureReading = constrain( rawValue, SENSOR_MIN_TEMPERATURE, MAX_DISPLAY_TEMPERATURE );
-	// writeToSerial(); todo turn on
-	delay(1);
+	writeToSerial();
+	delay( 1 );
 }
 
 void rollingTitle( String label, Adafruit_SSD1306 &display ){
 
-	byte destinationY = DISPLAY_HEIGHT/2 + 10;
+	byte destinationY = ( DISPLAY_HEIGHT / 2 ) + 10;
 	float splashScreenTextPosition = 0;
 	byte stringLength = label.length();
-	byte splashRectWidth = (8 * stringLength) + 14;
+	byte splashRectWidth = ( 8 * stringLength ) + 14;
 	byte isCycle = 0; // 3 complete
 
-	display.setFont(&Lato_Thin_12);
-	display.setTextColor(BLACK);
-	display.setTextSize(1);
+	display.setFont( &Lato_Thin_12 );
+	display.setTextColor( BLACK );
+	display.setTextSize( 1 );
 
 	while( !isEqual( splashScreenTextPosition, destinationY )){
 
-		display.fillRoundRect(( DISPLAY_WIDTH - splashRectWidth )/2, DISPLAY_HEIGHT - splashScreenTextPosition, splashRectWidth,25, 3, BLACK); // clear previous num
+		display.fillRoundRect(( DISPLAY_WIDTH - splashRectWidth ) / 2, DISPLAY_HEIGHT - splashScreenTextPosition, splashRectWidth, 25, 3, BLACK ); // clear previous num
 		splashScreenTextPosition = lerp( splashScreenTextPosition, destinationY,  EASE_COEFFICIENT );
-		display.fillRoundRect(( DISPLAY_WIDTH - splashRectWidth )/2 , DISPLAY_HEIGHT - splashScreenTextPosition, splashRectWidth,25, 3, WHITE); // new rect
+		display.fillRoundRect(( DISPLAY_WIDTH - splashRectWidth ) / 2 , DISPLAY_HEIGHT - splashScreenTextPosition, splashRectWidth, 25, 3, WHITE ); // new rect
 
-		display.setCursor( (0.5 * stringLength) + (DISPLAY_WIDTH - splashRectWidth ) /2, DISPLAY_HEIGHT - splashScreenTextPosition + 17);
-		display.println(label);
+		display.setCursor(( 0.5 * stringLength ) + ( DISPLAY_WIDTH - splashRectWidth ) / 2, DISPLAY_HEIGHT - splashScreenTextPosition + 17);
+		display.println( label );
 
 		display.display();
 
@@ -934,7 +941,7 @@ void rollingTitle( String label, Adafruit_SSD1306 &display ){
 			isCycle++;
 		}
 
-		delay(16);
+		delay( 16 );
 	}
 
 	splashScreenTextPosition = 0;
@@ -951,8 +958,14 @@ void displayNumericScrollView( Adafruit_SSD1306 &display ){
 
 void drawNumeric( byte xOffset, byte yOffset, byte decimal, String label, Adafruit_SSD1306 &display ){
 
-	display.fillRect (xOffset, 0, 70, yOffset + 5, BLACK); // clear previous num
-	display.setFont(&Lato_Thin_30);
+	byte highLabelXOffset = DISPLAY_WIDTH / 2 + 15;
+	byte highLabelYOffset = yOffset + 24;
+
+	byte lowLabelXOffset = DISPLAY_WIDTH / 2 + 15;
+	byte lowLabelYOffset = yOffset + 35;
+
+	display.fillRect( xOffset, 0, 70, yOffset + 5, BLACK ); // clear previous num
+	display.setFont( &Lato_Thin_30 );
 	display.setTextColor( WHITE );
 
 	if( !isTemperatureReadingValid ){
@@ -962,41 +975,48 @@ void drawNumeric( byte xOffset, byte yOffset, byte decimal, String label, Adafru
 
 		display.setCursor( xOffset - 20	, yOffset );
 
-		char buffer[4];
-		display.print( dtostrf(currentDisplayReading, 4, 0, buffer));
+		char buffer[ 4 ];
+		display.print( dtostrf( currentDisplayReading, 4, 0, buffer ));
 	}
 
 	// Temp Unit Label
-	display.setTextSize(1);
+	display.setTextSize( 1 );
 	display.setFont( &Lato_Thin_12 );
-	display.setCursor( xOffset + DISPLAY_WIDTH/2 - 8, yOffset );
+	display.setCursor( xOffset + ( DISPLAY_WIDTH / 2 ) - 8, yOffset );
 	display.print( label );
 
 	display.setFont();
 	display.setCursor( 0, yOffset + 4 );
 
-	display.fillRect (xOffset, yOffset + 3, DISPLAY_WIDTH, 10, BLACK); // clear previous num
-	display.fillRect (xOffset, yOffset + 5, ( DISPLAY_WIDTH ) + 8, 40, BLACK); // clear state area
+	display.fillRect( xOffset, yOffset + 3, DISPLAY_WIDTH, 10, BLACK ); // clear previous num
+	display.fillRect( xOffset, yOffset + 5, DISPLAY_WIDTH + 8, 40, BLACK ); // clear state area
 
 	// clear the HIGH speed indicator circle
-	display.fillCircle( DISPLAY_WIDTH / 2 + 19, yOffset + 20, 7, ( highSpeedFanShouldRun ));
+	display.fillCircle( highLabelXOffset + 2, highLabelYOffset - 4, 7, ( highSpeedFanShouldRun ));
 
-	// paint high and low letters, regardless of state, since they're always black, and a run state introduces a white-filled circle
+	// paint high and low letters, regardless of state, since they're always black,
+	// and a run state introduces a white-filled circle
 	// note: this is done before the cooldown animation, which also uses the LOW speed circle area,
 	// to allow for the cooldown outer ring to not collide with this element
 	display.setFont( &Lato_Thin_12 );
-	display.setCursor( DISPLAY_WIDTH / 2 + 15,  yOffset + 24 );
+	display.setCursor( highLabelXOffset - 2, highLabelYOffset );
 	display.setTextColor( BLACK );
-	display.print("H");
+	display.print( "H" );
 
-	drawCooldownAnimation( display, yOffset + 15 );
+	drawCooldownAnimation( display, lowLabelXOffset + 2 , lowLabelYOffset - 4 );
 
 	// clear the LOW speed indicator circle
 	// note: this is done after the cooldown display, which collides with the LOW speed circle area,
 	// to allow for the cooldown outer ring to not collide with this element
-	display.fillCircle( DISPLAY_WIDTH / 2 + 19, yOffset + 35, 7, ( lowSpeedFanShouldRun ));
+	if( !highSpeedFanShouldRun ){
 
-	display.setCursor( DISPLAY_WIDTH / 2 + 16,  yOffset + 39 );
+		// if heat soak is probable, we want to show the buffered cooling state in the LOW speed circle area,
+		// which is done in the cooldown animation function, so we skip clearing the LOW speed circle to allow
+		// the cooldown animation to use it as intended
+		display.fillCircle( lowLabelXOffset + 2, lowLabelYOffset - 4, 7, ( lowSpeedFanShouldRun ));
+	}
+
+	display.setCursor( lowLabelXOffset - 1,  lowLabelYOffset );
 	display.setTextColor( BLACK );
 	display.print("L");
 
@@ -1008,11 +1028,15 @@ void drawNumeric( byte xOffset, byte yOffset, byte decimal, String label, Adafru
 
 		display.setTextColor( !noTemperatureDataAlertUI );
 		display.setCursor( 0, yOffset + 22 );
-		display.print( F(" NO TEMPERATURE DATA") );
+		display.print( F("  NO TEMPERATURE      SENSOR DATA") );
 		display.setTextColor( WHITE );
 
 		return; // prevent UI draw collisions
 	}else if( isEditingLowSpeedTrigger || isEditingHighSpeedTrigger ){
+
+		display.setTextColor( WHITE );
+		display.setCursor( xOffset, yOffset + 10 );
+		display.setFont();
 
 		display.print( F("SET TRIGGERS") );
 
@@ -1030,52 +1054,28 @@ void drawNumeric( byte xOffset, byte yOffset, byte decimal, String label, Adafru
 		display.print( HIGH_LABEL );
 		display.print( " : " );
 		display.print( highSpeedTriggerTemperature );
-	}else if( currentTemperatureReading < OVERHEAT_TEMPERATURE && ( externalRequestToRunLowSpeed || isBufferCooling )){
+	}else if( isBufferCooling ){
 
-		display.setFont( &Lato_Thin_12 );
-		display.setTextColor( BLACK );
+		display.drawRoundRect( 0, yOffset + 15, 58, 18, 2, WHITE );
 
-		if( externalRequestToRunLowSpeed ){
-
-			display.setCursor( 15, yOffset + 20 );
-			display.fillRoundRect(10, yOffset + 10, 60, 12, 2, WHITE );
-			display.print( F("A/C ON") );
-		}
-
-		if( isBufferCooling ){
-			display.fillRoundRect(10, yOffset + 30, 60, 12, 2, WHITE );
-			display.setCursor( 15, yOffset + 40 );
-			display.print( F("BUFFER") );
-		}
-	}else if( vehicleState == STATE_COOLDOWN ){
-
-		display.setFont( &Lato_Thin_12 );
-		display.setCursor( 3, yOffset + 28 );
-		display.setTextColor( BLACK );
-
-		display.fillRoundRect( 2, yOffset + 15, 72, 18, 2, WHITE );
-		display.print( F("HEATSOAK") );
-
-		// communicate the specific strategy for best preventing heat soak
-		display.setFont();
-		display.setCursor( 2, yOffset + 36 );
 		display.setTextColor( WHITE );
-		display.print( F("MODE:") );
-		display.print( ( (int)remainingExtensions > 0 ) ? F(" EXTEND") : lowSpeedFanShouldRun ? F(" NORMAL") : F("MONITOR") );
+		display.setFont( &Lato_Thin_12 );
+		display.setCursor( 4, yOffset + 28 );
+		display.print( F("BUFFER") );
 	}else{
 
 		display.setFont( &Lato_Thin_12 );
-		display.setCursor( 7, yOffset + 28 );
+		display.setCursor( 4, yOffset + 28 );
 		display.setTextColor( WHITE );
 
 		if( isHighOverride || isLowOverride ){
 
-			display.drawRoundRect( 2, yOffset + 15, 72, 18, 2, WHITE );
+			display.drawRoundRect( 0, yOffset + 15, 72, 18, 2, WHITE );
 			display.print( F("OVERRIDE") );
 		// under temp
 		}else if( currentTemperatureReading < OPERATING_TEMPERATURE ){
 
-			display.drawRoundRect( 2, yOffset + 15, 68, 18, 2, WHITE );
+			display.drawRoundRect( 0, yOffset + 15, 66, 18, 2, WHITE );
 			display.print( F("HEATING") );
 
 		// system at operating temperature
@@ -1085,54 +1085,96 @@ void drawNumeric( byte xOffset, byte yOffset, byte decimal, String label, Adafru
 
 		}else if( isOverHeating ){
 
-			display.fillRoundRect( 2, yOffset + 15, 68, 18, 2, WHITE );
+			display.fillRoundRect( 0, yOffset + 15, 66, 18, 2, WHITE );
 			display.setTextColor( BLACK );
-			display.setCursor( 5, yOffset + 28 );
+			display.setCursor( 2, yOffset + 28 );
 			display.print( F("WARNING!") );
 
 		// actively cooling
 		}else if( lowSpeedFanShouldRun || highSpeedFanShouldRun ){
 
-			display.drawRoundRect( 2, yOffset + 15, 68, 18, 2, WHITE );
+			display.drawRoundRect( 0, yOffset + 15, 66, 18, 2, WHITE );
 			display.print( F("COOLING") );
 		}
 	}
 
+	if( externalRequestToRunLowSpeed  && !( isEditingLowSpeedTrigger || isEditingHighSpeedTrigger ) ){
+
+		display.fillRoundRect( 54, yOffset + 4, 16, 9, 2, WHITE );
+
+		display.setFont();
+		display.setCursor( 56, yOffset + 5 );
+		display.setTextColor( BLACK );
+		display.print( F("AC") );
+	}
+
+	if( vehicleState == STATE_COOLDOWN && !( isEditingLowSpeedTrigger || isEditingHighSpeedTrigger )){
+
+		display.fillRoundRect( 0, yOffset + 4, 51, 9, 2, WHITE );
+
+		display.setFont();
+		display.setCursor( 2, yOffset + 5 );
+		display.setTextColor( BLACK );
+		display.print( F("HEATSOAK") );
+
+		// communicate the specific strategy for best preventing heat soak
+		display.setFont();
+		display.setCursor( 2, yOffset + 36 );
+		display.setTextColor( WHITE );
+		display.print( F("MODE:") );
+		display.print( ( (int)remainingExtensions > 0 ) ? F("EXTEND") : lowSpeedFanShouldRun ? F("NORMAL") : F("SENTRY") );
+	}
+
 	if( isEditingLowSpeedTrigger ){
-		display.drawRoundRect(0, yOffset + 15, 40, 14, 2, WHITE );
+
+		display.drawRoundRect( 0, yOffset + 15, 40, 14, 2, WHITE );
 	}
 
 	if( isEditingHighSpeedTrigger ){
-		display.drawRoundRect(0, yOffset + 29, 40, 14, 2, WHITE );
+
+		display.drawRoundRect( 0, yOffset + 29, 40, 14, 2, WHITE );
 	}
 }
 
-void drawCooldownAnimation( Adafruit_SSD1306 &display, byte yOffset ){
+void drawCooldownAnimation( Adafruit_SSD1306 &display, byte xOffset, byte yOffset ){
 
 if( vehicleState != STATE_COOLDOWN ) { return; }
 
 	float progress = getCooldownProgress();
 
+	const float totalSegmentSpan = 108.0f; // total degrees occupied by all segments + gaps
+	const float gapDegrees = 8.0f;
+
+	// avoid divide-by-zero
+	byte segmentCount = maxExtensionsThisCycle + 1;
+
+	// total space consumed by gaps
+	float totalGapSpace = gapDegrees * ( segmentCount - 1  );
+
+	// remaining angular space available for visible segment widths
+	float segmentWidth = segmentCount == 1 ? totalSegmentSpan : ( totalSegmentSpan - totalGapSpace ) / segmentCount;
+
 	// Outer ring to represent extensions remaining vs total available extensions for cooldown
-	drawDonutSegmentsAA(
+	drawDonutSegments(
 		display,
-		DISPLAY_WIDTH / 2 + 20, yOffset + 18,
-		9, // radius
-		3, // thickness
-		MAX_EXTENSIONS,
+		xOffset, yOffset,
+		14, // radius
+		4, // thickness
+		segmentCount,
 		remainingExtensions,
-		-60, // start angle (top center)
-		28, // span of each segment (degrees)
-		12 // gap between segments (degrees)
+		-50, // start angle (top center)
+		segmentWidth, // span of each segment (degrees)
+		( segmentCount > 1 ) ? gapDegrees : 0 // gap between segments (degrees)
 	);
 
-	// Inner filled circle, divided into slices, to represent progress of a current cooldown cycle
-	drawProgressFilledCircle(
+	// Inner filled arc, divided into slices, to represent progress of a current cooldown cycle
+	drawProgressArc(
 		display,
-		DISPLAY_WIDTH / 2 + 20, yOffset + 18,
-		7, // radius
+		xOffset, yOffset,
+		10, // radius
+		2, // thickness
 		progress,
-		false, // invert
+		1, // 1: CCW 0: CW
 		SSD1306_WHITE
 	);
 }
@@ -1153,9 +1195,9 @@ void displayAnimatedFan( Adafruit_SSD1306 &display ){
 	const float centerX = (DISPLAY_WIDTH  - (radius * 2.0f) + radius ) - 3.0f;
 	const float centerY = (DISPLAY_HEIGHT / 2.0f) + radius + 1.0f;
 
-	display.fillCircle(roundf( centerX ), roundf( centerY ), radius + 2, BLACK);
-	display.drawCircle(roundf( centerX ), roundf( centerY ), radius + 2, WHITE);
-	display.fillCircle(roundf( centerX ), roundf( centerY ), 2, WHITE);
+	display.fillCircle( roundf( centerX ), roundf( centerY ), radius + 2, BLACK );
+	display.drawCircle( roundf( centerX ), roundf( centerY ), radius + 2, WHITE );
+	display.fillCircle( roundf( centerX ), roundf( centerY ), 2, WHITE );
 
 	for( int i = 0; i < numberOfFanBlades; i++ ){
 
@@ -1183,6 +1225,7 @@ void drawGraph( byte xOffset, byte yOffset, byte scrollingGraphWidth, Adafruit_S
 			display.writeFastVLine( scrollingGraphWidth + xOffset - (step * 2 ), start, length, WHITE ); // Line Datum
 		}
 	}
+
 	if( advanceGraph ){
 		// advanced historical values
 		for( byte step2 = SCROLLING_GRAPH_SAMPLE_SIZE; step2 >= 2; step2-- ){
@@ -1204,15 +1247,17 @@ void wipeDisplay( Adafruit_SSD1306 &display ){
 	display.display(); // because fillScreen is misleading
 }
 
-bool isEqual(float x, float y){
+bool isEqual( float x, float y ){
+
 	return abs(x - y) <= 1e-2 * abs(x);
 }
 
-float lerp(float a, float b, float x){
-	return a + x * (b - a);
+float lerp( float a, float b, float x ){
+
+	return a + x * ( b - a );
 }
 
-void drawFanBlade(float radius, float cx, float cy, float angleOffsetDegrees, Adafruit_SSD1306 &display ) {
+void drawFanBlade( float radius, float cx, float cy, float angleOffsetDegrees, Adafruit_SSD1306 &display ){
 
 	const float hubClearance = 5.0f; // distance from center to blade base
 	const float bladeLength = radius - hubClearance - 1; // blade span (pixels)
@@ -1304,47 +1349,74 @@ float getCooldownProgress(){
 
 	float progress = (float)remaining / (float)total;
 
-	return clamp01( progres s);
+	return clamp01( progress );
 }
 
-
-void drawProgressFilledCircle(
+void drawProgressArc(
 	Adafruit_SSD1306 &display,
-	int16_t cx, int16_t cy,
-	int16_t radius,
+	int16_t cx,
+	int16_t cy,
+	int16_t innerRadius,
+	int16_t thickness,
 	float progress,
-	bool invert,
+	byte direction,
 	uint16_t color
-) {
+){
+
 	progress = clamp01( progress );
-	if( invert ) progress = 1.0f - progress;
+
 	if( progress <= 0.0f ) return;
 
-	float drawAngle = progress * TWO_PI;
-	int r2 = radius * radius;
+	const int outerRadius = innerRadius + thickness;
 
-	for( int y = -radius; y <= radius; y++ ){
+	const int innerR2 = innerRadius * innerRadius;
+	const int outerR2 = outerRadius * outerRadius;
 
-		for( int x = -radius; x <= radius; x++ ){
+	// remaining sweep
+	float sweep = progress * TWO_PI;
 
+	for( int y = -outerRadius; y <= outerRadius; y++ ){
 
-			float dx = x + 0.5f;
-			float dy = y + 0.5f;
+		int yy = y * y;
 
-			if( dx * dx + dy * dy > r2 + radius * 0.5f ) continue;
+		for( int x = -outerRadius; x <= outerRadius; x++ ){
 
-			float angle = atan2f( dx, -dy );
-			if( angle < 0 ) angle += TWO_PI;
+			int d2 = x * x + yy;
 
-			if( angle <= drawAngle ){
+			// donut bounds
+			if( d2 > outerR2 ) continue;
+			if( d2 < innerR2 ) continue;
 
-				display.drawPixel( cx + x, cy + y, color );
+			float angle;
+
+			if( direction == 1 ){ // decrement CCW
+
+				// 0 at top, CW positive
+				angle = atan2f( (float)x, -(float)y );
+
+			}else if( direction == 0 ){ // decrement CW
+
+				// 0 at top, CCW positive
+				angle = atan2f( -(float)x, -(float)y);
+			}
+
+			if( angle < 0.0f ){
+				angle += TWO_PI;
+			}
+
+			if( angle <= sweep ){
+
+				display.drawPixel(
+					cx + x,
+					cy + y,
+					color
+				);
 			}
 		}
 	}
 }
 
-void drawDonutSegmentsAA(
+void drawDonutSegments(
 	Adafruit_SSD1306 &display,
 	int cx, int cy,
 	int innerRadius,
@@ -1355,63 +1427,60 @@ void drawDonutSegmentsAA(
 	float spanDeg,
 	float gapDeg
 ) {
+
 	int outerRadius = innerRadius + thickness;
 
 	display.fillCircle( cx, cy, outerRadius, BLACK );
 
 	float startRad = radians( startDeg );
-	float spanRad  = radians( spanDe g);
-	float gapRad   = radians( gapDeg );
+	float spanRad = radians( spanDeg );
+	float gapRad = radians( gapDeg );
+
+	float segmentPitch = spanRad + gapRad;
+
+	int innerR2 = innerRadius * innerRadius;
+	int outerR2 = outerRadius * outerRadius;
 
 	int minX = cx - outerRadius;
 	int maxX = cx + outerRadius;
 	int minY = cy - outerRadius;
 	int maxY = cy + outerRadius;
 
-	for (int i = 0; i < maxSegments; i++) {
+	for( int y = minY; y <= maxY; y++ ){
 
-		bool active = (i < activeSegments);
-		uint16_t color = active ? WHITE : BLACK;
+		for( int x = minX; x <= maxX; x++ ){
 
-		// each segment has fixed width
-		float a0 = startRad + i * (spanRad + gapRad);
-		float a1 = a0 + spanRad;
+			int dx = x - cx;
+			int dy = y - cy;
 
-		// normalize
-		while( a0 < 0 ) a0 += TWO_PI;
-		while( a1 < 0 ) a1 += TWO_PI;
-		while( a0 >= TWO_PI ) a0 -= TWO_PI;
-		while( a1 >= TWO_PI ) a1 -= TWO_PI;
+			int r2 = dx * dx + dy * dy;
 
-		for( int y = minY; y <= maxY; y++ ){
+			if( r2 < innerR2 ) continue;
+			if( r2 > outerR2 ) continue;
 
-			for( int x = minX; x <= maxX; x++ ){
+			float angle = atan2f( dx, -dy );
 
-				float dx = x - cx;
-				float dy = y - cy;
+			if( angle < 0 ){
+				angle += TWO_PI;
+			}
 
-				float r2 = dx*dx + dy*dy;
+			// FIXED WRAP
+			float rel = fmodf(
+				angle - startRad + TWO_PI,
+				TWO_PI
+			);
 
-				if( r2 < innerRadius * innerRadius ) continue;
-				if( r2 > outerRadius * outerRadius ) continue;
+			int segment = (int)( rel / segmentPitch );
 
-				float angle = atan2f( dx, -dy );
+			if( segment >= maxSegments ) continue;
 
-				if( angle < 0 ) angle += TWO_PI;
+			float local = rel - ( segment * segmentPitch );
 
-				bool inAngle;
+			if( local <= spanRad ){
 
-				if( a0 <= a1 ){
+				if( segment < activeSegments ){
 
-					inAngle = ( angle >= a0 && angle <= a1 );
-				} else {
-
-					inAngle = ( angle >= a0 || angle <= a1 );
-				}
-
-				if( inAngle ){
-
-					display.drawPixel( x, y, color );
+					display.drawPixel( x, y, WHITE );
 				}
 			}
 		}
